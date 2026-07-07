@@ -1,0 +1,45 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# NIFTY AI Agent — Dependencies
+# Install: pip install -r requirements.txt
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Core ──────────────────────────────────────────────────────────────────────
+python-dotenv>=1.0.0
+pydantic>=2.5.0
+pydantic-settings>=2.1.0
+
+# ── Data ──────────────────────────────────────────────────────────────────────
+pandas>=2.0.0
+numpy>=1.24.0
+requests>=2.31.0
+yfinance>=0.2.36
+pytz>=2023.3
+feedparser>=6.0.10
+
+# NSE option chain is behind Akamai bot detection — a real headless browser is
+# used as a fallback when the plain HTTP request gets blocked. After installing,
+# run once: `playwright install chromium`
+playwright>=1.40.0
+
+# ── Technical indicators ──────────────────────────────────────────────────────
+ta>=0.11.0
+
+# ── Database ──────────────────────────────────────────────────────────────────
+sqlalchemy>=2.0.0
+
+# ── AI ────────────────────────────────────────────────────────────────────────
+anthropic>=0.40.0
+
+# ── Notifications (Pushover — iPhone/Android push alerts) ─────────────────────
+# No extra package needed: uses plain requests HTTP POST to api.pushover.net
+
+# ── Dashboard ─────────────────────────────────────────────────────────────────
+streamlit>=1.35.0
+plotly>=5.20.0
+
+# ── Scheduler ─────────────────────────────────────────────────────────────────
+schedule>=1.2.0
+
+# ── Testing ───────────────────────────────────────────────────────────────────
+pytest>=7.4.0
+pytest-cov>=4.1.0
