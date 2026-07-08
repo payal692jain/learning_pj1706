@@ -1,7 +1,7 @@
-# NIFTY AI Signal Agent
+# NIFTY + SENSEX AI Signal Agent
 
-An AI-assisted trading signal agent for Indian markets — NIFTY 50 weekly **and monthly** expiry options.
-Generates BUY_CE / BUY_PE / HOLD signals every 5 minutes during market hours, with multi-layer confidence scoring (RSI analysis + option chain OI levels + heavyweight breadth), sends a full pre-market morning brief at 8 AM, and delivers everything to your iPhone via Pushover notifications and a Streamlit dashboard.
+An AI-assisted trading signal agent for Indian markets — **NIFTY 50** and **BSE SENSEX** weekly **and monthly** expiry options.
+Runs two independent strategies (EMA Crossover + VWAP Breakout) every 5 minutes during market hours, each scored through a multi-layer confidence pipeline (RSI analysis + option chain OI levels + heavyweight breadth), fetches **live** option chain premiums via the Upstox API (with automatic fallback to an NSE scrape and finally a VIX-based estimate if live data is unavailable), sends a full pre-market morning brief at 8 AM, and delivers every prediction to your iPhone via Pushover notifications and a Streamlit dashboard.
 
 > **No automated order placement. Signal generation only.**
 
@@ -35,15 +35,18 @@ Every morning at 8 AM (pre-market):
   → Claude AI synthesises everything into a daily trading plan
   → Sends 5–6 Pushover notifications to your iPhone
 
-Every 5 minutes during market hours (9:15 AM – 3:30 PM):
-  → Fetches live NIFTY spot price
+Every 5 minutes during market hours (9:15 AM – 3:30 PM) — for BOTH NIFTY and SENSEX:
+  → Fetches live spot price
   → Fetches 5-minute intraday OHLCV bars (10 days ≈ 700 candles)
   → Calculates RSI, EMA20, EMA50, MACD, ATR, VWAP
+  → Fetches the live option chain (see "Live Option Chain Data" below) — weekly AND
+    monthly premiums, skipping any contract expiring today in favour of the next one
 
-  SIGNAL GENERATION:
-  → EMA Crossover strategy → raw BUY_CE / BUY_PE / HOLD signal
+  SIGNAL GENERATION — every strategy runs independently, every cycle:
+  → EMA Crossover strategy   → raw BUY_CE / BUY_PE / HOLD signal
+  → VWAP Breakout strategy   → raw BUY_CE / BUY_PE / HOLD signal
 
-  MULTI-LAYER CONFIDENCE SCORING:
+  MULTI-LAYER CONFIDENCE SCORING (applied separately to each strategy's signal):
   Layer 1 — RSI Analysis
     · Zone: DEEPLY_OVERSOLD / OVERSOLD / NEUTRAL / OVERBOUGHT / DEEPLY_OVERBOUGHT
     · Trend: RSI rising or falling over last 5 bars
@@ -68,9 +71,31 @@ Every 5 minutes during market hours (9:15 AM – 3:30 PM):
     · Advance/decline among HDFCBANK, Reliance, ICICI, Infy, TCS, L&T, Kotak, Axis, SBI, Airtel
     → Adjusts confidence −12 to +8 points
 
-  → Final signal saved to SQLite, sent via Pushover, shown on dashboard
-  → Claude AI explains the signal using concepts from your trading book library
+  → Every strategy's final signal saved to SQLite, sent via Pushover (one message
+    listing all predictions side by side), shown on dashboard
+  → Claude AI explains each signal using concepts from your trading book library
 ```
+
+### Live Option Chain Data (weekly + monthly, both indices)
+
+Real option premiums are hard to get reliably — NSE's website sits behind Akamai bot
+detection, and there is no official public BSE option chain API. The agent tries three
+tiers, cheapest/most-reliable first, and always shows which tier produced the price:
+
+```
+1. Upstox API (if UPSTOX_ACCESS_TOKEN is set)  — real authenticated REST API, live LTP/OI
+2. NSE plain HTTP scrape                       — fast, works when Akamai isn't blocking today
+3. NSE headless-browser scrape (Playwright)    — a real Chromium loads nseindia.com so
+                                                  Akamai's bot-check JS passes, then reads
+                                                  the JSON endpoint directly
+4. VIX-based synthetic estimate (last resort)  — Black-Scholes price from spot + India VIX;
+                                                  notifications label this "(Est.)" so it's
+                                                  never mistaken for a real traded premium
+```
+Tiers 2–4 apply to NIFTY only (BSE has no scrape-based middle tier — SENSEX goes straight
+from Upstox to the synthetic estimate if Upstox isn't configured). Whichever contract is
+nearest to expiring **today is skipped** — an option with hours left to trade isn't useful
+for a fresh signal, so "weekly" always means the *next* available expiry.
 
 ---
 
@@ -81,22 +106,24 @@ Every 5 minutes during market hours (9:15 AM – 3:30 PM):
 | **Language** | Python 3.10+ | Primary language |
 | **Data Models** | Pydantic v2, Dataclasses | Type-safe structured data |
 | **Configuration** | pydantic-settings, python-dotenv | `.env` file management |
-| **Market Data** | yfinance | NIFTY OHLCV, global indices, NIFTY 50 stocks |
-| **Option Chain** | NSE India API | Weekly + monthly chain, PCR, max pain |
+| **Market Data** | yfinance | NIFTY/SENSEX OHLCV, global indices, NIFTY 50 stocks |
+| **Option Chain (live)** | Upstox API | Real weekly + monthly LTP/OI for NIFTY *and* SENSEX |
+| **Option Chain (fallback)** | NSE India API, Playwright | HTTP scrape, then headless-browser scrape if Akamai blocks |
+| **Option Chain (last resort)** | Black-Scholes (`math.erf`) | VIX-based theoretical price, labelled "(Est.)" |
 | **News** | feedparser | RSS from ET Markets, Moneycontrol, Reuters, Livemint |
 | **Indicators** | pandas, numpy | RSI, EMA, MACD, ATR, VWAP (stateless) |
-| **Strategy** | Custom | EMA20/50 Crossover + RSI confirmation |
-| **Confidence Scoring** | 4-layer system | RSI analysis + weekly OC + monthly OC + breadth |
+| **Strategies** | Custom, run independently | EMA20/50 Crossover + RSI confirmation; VWAP Breakout + momentum |
+| **Confidence Scoring** | 4-layer system, per strategy | RSI analysis + weekly OC + monthly OC + breadth |
 | **Risk** | ATR-based | SL/Target/RR calculator |
 | **AI** | anthropic SDK | Claude `claude-opus-4-8` — signal explanation + daily plan |
 | **Knowledge Base** | Hardcoded patterns | 23 patterns from 6 trading books |
-| **Database** | SQLAlchemy 2.0, SQLite | Signals, market data, trades |
-| **Notifications** | Pushover HTTP API | iPhone push alerts (priority-based) |
-| **Dashboard** | Streamlit, Plotly | Live candlestick + indicator chart |
-| **Scheduler** | schedule | 8 AM daily + 5-min intraday loop |
+| **Database** | SQLAlchemy 2.0, SQLite | Signals (one row per strategy per cycle), market data, trades |
+| **Notifications** | Pushover HTTP API | iPhone push alerts, one message listing every strategy's prediction |
+| **Dashboard** | Streamlit, Plotly | Live candlestick + indicator chart, per-strategy prediction cards |
+| **Scheduler** | schedule | 8 AM daily + 5-min intraday loop, both indices |
 | **Timezone** | pytz | IST market hours enforcement |
-| **Testing** | pytest, pytest-cov | 82%+ coverage, 193 tests |
-| **Version Control** | Git | `.env` and DB excluded via `.gitignore` |
+| **Testing** | pytest, pytest-cov | ~79% coverage, 250+ tests |
+| **Version Control** | Git | `.env`, `.venv/`, `.idea/` excluded via `.gitignore` |
 
 ---
 
@@ -104,7 +131,7 @@ Every 5 minutes during market hours (9:15 AM – 3:30 PM):
 
 ```
 ╔══════════════════════════════════════════════════════════════════════╗
-║                     NIFTY AI SIGNAL AGENT                           ║
+║               NIFTY + SENSEX AI SIGNAL AGENT                        ║
 ╚══════════════════════════════════════════════════════════════════════╝
 
 ┌─────────────────────────────────────────────────────────────────────┐
@@ -121,9 +148,9 @@ Every 5 minutes during market hours (9:15 AM – 3:30 PM):
 ╠═════════════════════════╣    ╠══════════════════════════════════════╣
 ║                         ║    ║                                      ║
 ║  Global Indices         ║    ║  ┌──────────────────────────────┐   ║
-║  (yfinance, 8 markets)  ║    ║  │ NSEDataProvider              │   ║
-║         +               ║    ║  │ · Spot: yfinance fast_info   │   ║
-║  GIFT Nifty             ║    ║  │ · OHLCV: 5m bars, 10 days   │   ║
+║  (yfinance, 8 markets)  ║    ║  │ DataProvider (NSE+BSE)       │   ║
+║         +               ║    ║  │ · Spot+OHLCV: yfinance       │   ║
+║  GIFT Nifty             ║    ║  │ · Options: Upstox→NSE→VIX est│   ║
 ║  (NSE IFSC API)         ║    ║  └──────────────┬───────────────┘   ║
 ║         +               ║    ║                 ▼                    ║
 ║  NIFTY 50 Stocks        ║    ║  ┌──────────────────────────────┐   ║
@@ -134,11 +161,11 @@ Every 5 minutes during market hours (9:15 AM – 3:30 PM):
 ║  WEEKLY Option Chain    ║    ║  └──────────────┬───────────────┘   ║
 ║  · ATM ± 3 strikes      ║    ║                 ▼                    ║
 ║  · CE/PE LTP & OI       ║    ║  ┌──────────────────────────────┐   ║
-║  · PCR, Max Pain        ║    ║  │   EMA Crossover Strategy     │   ║
-║  · OI resistance/support║    ║  │  BUY_CE: EMA20>EMA50 RSI>60  │   ║
-║  · Black-Scholes CE/PE  ║    ║  │  BUY_PE: EMA20<EMA50 RSI<40  │   ║
-║         +               ║    ║  │  HOLD:   all other           │   ║
-║  MONTHLY Option Chain   ║    ║  │  Confidence: 50–95%          │   ║
+║  · PCR, Max Pain        ║    ║  │  Strategy Engine (2, indep.) │   ║
+║  · OI resistance/support║    ║  │  1. EMA Crossover (EMA/RSI)  │   ║
+║  · Black-Scholes CE/PE  ║    ║  │  2. VWAP Breakout (VWAP/mom.)│   ║
+║         +               ║    ║  │  Each: BUY_CE/BUY_PE/HOLD    │   ║
+║  MONTHLY Option Chain   ║    ║  │  Confidence: 50–95% each     │   ║
 ║  · ATM ± 5 strikes      ║    ║  └──────────────┬───────────────┘   ║
 ║  · Monthly max pain     ║    ║                 ▼                    ║
 ║  · Monthly PCR          ║    ║  ┌──────────────────────────────┐   ║
@@ -204,6 +231,12 @@ Every 5 minutes during market hours (9:15 AM – 3:30 PM):
 └──────────────────────────────────────────────────────────────────────┘
 ```
 
+> The Intraday Pipeline box runs **twice** every 5 minutes — once for NIFTY
+> (`NSEDataProvider`, ₹50 strikes, weekly expiry Tuesday) and once for SENSEX
+> (`BSEDataProvider`, ₹100 strikes, weekly expiry Thursday) — and within each
+> run, both strategies fire independently, so every cycle produces up to
+> **4 predictions** (2 indices × 2 strategies).
+
 ---
 
 ## Component Details
@@ -215,15 +248,31 @@ Pydantic Settings loads all config from `.env`. Single `get_settings()` singleto
 
 ### 2. Data Layer (`nifty_ai_agent/data/`)
 
-#### `nse_provider.py` — NSEDataProvider
+#### `upstox_provider.py` — UpstoxOptionChainClient (live data, both indices)
+The primary source for real option chain data — an authenticated REST API, so there's
+no bot detection to work around.
+- **`get_expiries(index_name)`** — fetches available expiry dates from `/v2/option/contract`. Instrument keys: `NSE_INDEX|Nifty 50` (NIFTY), `BSE_INDEX|SENSEX` (SENSEX).
+- **`get_option_chain(index_name, expiry_date)`** — fetches strike-level OI/LTP/IV from `/v2/option/chain`, normalised into the same `strike/ce_oi/pe_oi/ce_ltp/pe_ltp/ce_iv/pe_iv` shape the rest of the pipeline expects.
+- **`drop_expiring_today()`** — an option expiring within hours has no meaningful time left to trade, so any expiry dated today is dropped before picking "weekly" — it always rolls forward to the next available expiry.
+- Access tokens expire nightly (~3:30 AM IST) — see [`scripts/upstox_login.py`](#setup--installation) for the daily refresh flow.
+
+#### `nse_provider.py` — NSEDataProvider (NIFTY)
 - **`get_spot_data()`** — yfinance `fast_info.last_price` for live price
 - **`get_historical_data(days, interval)`** — yfinance 5-minute bars (10 days ≈ 700 candles). Auto-flattens yfinance MultiIndex columns.
-- **`get_option_chain()`** — NSE India API with browser-mimicking headers. **Returns both weekly and monthly expiry data in a single API call:**
-  - Filters raw entries by `expiryDate` field per record
-  - `_identify_expiries()` scans the expiry dates list, groups by calendar month, and returns:
-    - **weekly** = nearest expiry
-    - **monthly** = last expiry of the same calendar month (if different from weekly), or last expiry of the following month if weekly IS the monthly (last week of the month)
+- **`get_option_chain()`** — four-tier fallback, cheapest/most-reliable first:
+  1. **Upstox** (if `UPSTOX_ACCESS_TOKEN` is set) — real live weekly + monthly LTP/OI
+  2. **Plain HTTP** against NSE's API — fast, works if Akamai isn't blocking today
+  3. **Headless-browser scrape** (Playwright) — loads `nseindia.com/option-chain` for real so Akamai's bot-check JS runs and sets valid cookies, then reads the JSON endpoint's rendered text directly
+  4. **VIX-based synthetic estimate** — Black-Scholes theoretical price from spot + India VIX; marked `is_live=False` so notifications label it "(Est.)"
+  - `_identify_expiries()` scans the expiry dates list (after dropping any expiring today), groups by calendar month, and returns:
+    - **weekly** = nearest remaining expiry
+    - **monthly** = last expiry of the same calendar month (if different from weekly), or last expiry of the following month if weekly IS the monthly
   - Computes PCR and max pain separately for each expiry
+
+#### `bse_provider.py` — BSEDataProvider (SENSEX)
+Same shape as `NSEDataProvider`, but there's no scrape-based middle tier — BSE has no
+reliable public option chain API to fall back on, so it's Upstox or straight to the
+VIX-based synthetic estimate.
 
 #### `market_context.py` — Global Indices + GIFT Nifty
 8 global indices via yfinance + GIFT Nifty from NSE IFSC API. Computes weighted `global_bias`.
@@ -270,13 +319,25 @@ All stateless pure functions — take a DataFrame, return a DataFrame with an ex
 
 ### 4. Strategy Engine (`nifty_ai_agent/strategies/`)
 
-#### `ema_crossover.py` — Primary Signal
+Both strategies below run **independently, every cycle** — neither one "wins"; each
+produces its own signal, gets its own confidence score, and is saved/notified separately
+(`main.py`'s `_STRATEGIES` list). Adding a third strategy is a one-line addition to that list.
+
+#### `ema_crossover.py` — EMA Crossover
 ```
 BUY_CE  →  EMA20 > EMA50  AND  RSI > 60
 BUY_PE  →  EMA20 < EMA50  AND  RSI < 40
 HOLD    →  all other
 ```
 Base confidence 50–95% from EMA separation % and RSI distance from threshold.
+
+#### `vwap_breakout.py` — VWAP Breakout
+```
+BUY_CE  →  close > VWAP by ≥ 0.15%  AND  price rising over the last 3 bars
+BUY_PE  →  close < VWAP by ≥ 0.15%  AND  price falling over the last 3 bars
+HOLD    →  all other
+```
+Base confidence 50–95% from breakout distance from VWAP and momentum strength.
 
 #### `rsi_analyser.py` — RSI Analysis (Layer 1)
 Goes beyond the binary threshold with 3 independent checks:
@@ -315,7 +376,9 @@ Goes beyond the binary threshold with 3 independent checks:
 
 **Max pain** — the strike that minimises total OI-weighted loss to all option buyers (where the market tends to pin near expiry).
 
-**Black-Scholes pricing** — ATM CE/PE theoretical prices using actual chain IV. Implemented with `math.erf` (no scipy dependency).
+**Black-Scholes pricing** — ATM CE/PE theoretical prices using actual chain IV. Implemented with `math.erf` (no scipy dependency). Also used as the last-resort synthetic estimate when no live chain is available (weekly *and* monthly, both marked `is_live=False`).
+
+**`ExpiryAnalysis.is_live`** — `True` when the price came from Upstox or the NSE scrape, `False` for the VIX-based synthetic estimate. The notification layer uses this to label prices "(Est.)" so a theoretical estimate is never mistaken for a real traded premium.
 
 ---
 
@@ -390,12 +453,27 @@ close/volume         strategy                       pnl
 ### 8. Notification Layer (`nifty_ai_agent/notifier/pushover.py`)
 Direct Pushover HTTP API — no extra SDK.
 
+**`send_multi_signal()`** sends one notification per cycle per index, listing every
+strategy's prediction side by side — title summarises all of them
+(`🔔 NIFTY — EMA_Crossover: BUY_CE 82% | VWAP_Breakout: HOLD 50%`), and the body has a
+section per strategy with its own contract line(s), risk levels, and reasoning.
+
+**Contract line(s)** show weekly *and* monthly together whenever both are available,
+each labelled with its source:
+```
+📌 Buy (Weekly): NIFTY 24400 CE  14-Jul-2026  @ ₹142
+📌 Buy (Monthly): NIFTY 24400 CE  28-Jul-2026  @ ₹351
+```
+If a price came from the VIX-based synthetic estimate instead of a live chain, the
+label becomes `(Weekly, Est.)` / `(Monthly, Est.)`. Sub-₹10 premiums (common for options
+near expiry) show two decimals instead of rounding to a misleading "₹0".
+
 | Message | Priority | Behaviour |
 |---------|----------|-----------|
-| BUY_CE / BUY_PE | 0 (Normal) | Sound + lock screen |
-| HOLD heartbeat | −1 (Low) | Silent |
+| Any strategy signals BUY_CE/BUY_PE | 0 (Normal) | Sound + lock screen |
+| All strategies HOLD | −1 (Low) | Silent |
 | Claude daily plan | +1 (High) | Bypasses Do Not Disturb; requires acknowledgement |
-| Monthly OC | 0 (Normal) | Sound + lock screen |
+| Monthly OC (morning report) | 0 (Normal) | Sound + lock screen |
 | Startup ping | 0 (Normal) | Agent alive confirmation |
 
 3 retries with 2-second backoff. Returns `False` on total failure — never crashes.
@@ -405,27 +483,25 @@ Direct Pushover HTTP API — no extra SDK.
 ### 9. Dashboard (`dashboard/app.py`)
 Streamlit + Plotly, reads live from SQLite.
 
+- **One prediction card per strategy**, side by side — signal, confidence, entry/SL/target/RR, and AI reasoning shown independently for EMA Crossover and VWAP Breakout
 - 3-panel Plotly chart: Candlestick + EMA20/50, RSI (with 60/40 lines), MACD histogram
-- Signal box (green/red/yellow) with confidence %
-- Entry / SL / Target / RR metric cards
-- Claude AI explanation card
-- Indicator snapshot (EMA, RSI, MACD, breadth score, PCR, max pain)
-- Signal history table (last 50)
+- Signal history table (last 50) with a **Strategy column and filter**
 - Auto-refresh every 60 seconds
 
 ---
 
 ## Signal Confidence Scoring
 
-Every BUY signal's confidence is adjusted by 4 independent layers before it fires:
+Every BUY signal's confidence — from **either** strategy, scored independently — is
+adjusted by the same 4 layers before it fires:
 
 ```
-Base confidence (EMA crossover)         50 – 95%
-  + Layer 1: RSI analysis               −12 to +11
-  + Layer 2: Weekly option chain        −22 to  +9
-  + Layer 3: Monthly option chain       −14 to  +3
-  + Layer 4: Breadth (10 heavyweights)  −12 to  +8
-  ─────────────────────────────────────────────────
+Base confidence (EMA Crossover OR VWAP Breakout)  50 – 95%
+  + Layer 1: RSI analysis                          −12 to +11
+  + Layer 2: Weekly option chain                    −22 to  +9
+  + Layer 3: Monthly option chain                   −14 to  +3
+  + Layer 4: Breadth (10 heavyweights)               −12 to  +8
+  ─────────────────────────────────────────────────────────────
 Final confidence (clamped 10–95%)
 ```
 
@@ -455,11 +531,13 @@ Reason: EMA20 (24,120) > EMA50 (24,050) with RSI at 67.1. RSI OVERBOUGHT
 - Git
 - Pushover account (pushover.net — $5 one-time licence after 30-day trial)
 - Anthropic API key (console.anthropic.com — optional)
+- Upstox trading account + developer app (upstox.com — free; optional but strongly recommended for live option prices instead of the synthetic estimate)
 
 ### Step 1 — Install
 ```bash
 cd c:\my_learnings\market_analysyis
 pip install -r requirements.txt
+playwright install chromium   # one-time — used as the NSE-scrape fallback tier
 ```
 
 ### Step 2 — Configure
@@ -476,16 +554,34 @@ PUSHOVER_API_TOKEN=your_app_token      # create an app at pushover.net
 # Optional — enables AI explanations and daily plan
 ANTHROPIC_API_KEY=sk-ant-...           # from console.anthropic.com
 
+# Optional — enables live weekly + monthly option chain prices for NIFTY + SENSEX.
+# Without these, the agent falls back to an NSE scrape and finally a VIX-based
+# estimate (clearly labelled "(Est.)" in notifications).
+UPSTOX_API_KEY=your_api_key            # from account.upstox.com/developer/apps
+UPSTOX_API_SECRET=your_api_secret
+UPSTOX_REDIRECT_URI=https://www.google.com/upstox-callback  # must be https://, not localhost
+UPSTOX_ACCESS_TOKEN=                   # filled in daily — see Step 3
+
 # Market data defaults (fine as-is)
 NIFTY_SYMBOL=^NSEI
+SENSEX_SYMBOL=^BSESN
 DATA_FETCH_INTERVAL_MINUTES=5
 DATA_INTERVAL=5m
 HISTORICAL_DAYS=10
 ```
 
-### Step 3 — Run
+### Step 3 — Refresh the Upstox token (skip if not using Upstox)
+Upstox access tokens expire nightly (~3:30 AM IST) — there's no long-lived refresh
+token, so this runs once each morning before market open:
 ```bash
-# Terminal 1 — signal agent + morning reports
+python scripts/upstox_login.py
+# Opens the Upstox login page — log in, then paste back the redirected URL.
+# Writes a fresh UPSTOX_ACCESS_TOKEN into .env automatically.
+```
+
+### Step 4 — Run
+```bash
+# Terminal 1 — signal agent + morning reports (both NIFTY and SENSEX)
 python main.py
 
 # Terminal 2 — dashboard
@@ -493,10 +589,10 @@ streamlit run dashboard/app.py
 # Opens at http://localhost:8501
 ```
 
-### Step 4 — Add to iPhone home screen
+### Step 5 — Add to iPhone home screen
 Safari → `http://<your-laptop-ip>:8501` → Share → Add to Home Screen
 
-### Step 5 — Auto-start on Windows (optional)
+### Step 6 — Auto-start on Windows (optional)
 `Win + R` → `shell:startup` → create `start_agent.bat`:
 ```bat
 @echo off
@@ -511,7 +607,8 @@ python main.py
 ### Daily workflow
 ```
 07:55 AM  →  Ensure python main.py is running
-08:00 AM  →  Pushover messages arrive:
+             (If using Upstox: run scripts/upstox_login.py first — token expired overnight)
+08:00 AM  →  Pushover messages arrive (NIFTY):
               ① Global bias + GIFT Nifty level
               ② NIFTY 50 advance/decline + top movers
               ③ Weekly option chain: CE/PE table, max pain, PCR, OI levels
@@ -519,52 +616,67 @@ python main.py
               ⑤ News headlines (silent)
               ⑥ Claude daily plan (HIGH priority, if API key set)
 
-09:15 AM  →  Market opens; 5-min signal loop begins
-              BUY_CE or BUY_PE → sound alert with full confidence breakdown
-              HOLD → silent (agent heartbeat)
+09:15 AM  →  Market opens; 5-min signal loop begins for NIFTY and SENSEX
+              Each cycle → both EMA Crossover and VWAP Breakout fire independently
+              Any strategy signalling BUY_CE/BUY_PE → sound alert, full breakdown
+              All strategies HOLD → silent (agent heartbeat)
 
 03:30 PM  →  Market closes; signal loop stops automatically
+16:00 PM  →  EOD prediction run (after-hours outlook for next session)
 ```
 
 ### Reading a signal notification
 ```
-📈 NIFTY — BUY_CE · 84% confidence
-Entry: 24,120  SL: 23,984  Target: 24,390  RR: 1:2.0
+🔔 NIFTY — EMA_Crossover: BUY_CE 84% | VWAP_Breakout: HOLD 50%
 
+📈 EMA_Crossover — BUY_CE (84%)
+📌 Buy (Weekly): NIFTY 24400 CE  14-Jul-2026  @ ₹142
+📌 Buy (Monthly): NIFTY 24400 CE  28-Jul-2026  @ ₹351
+Entry 24,120  SL 23,984  Target 24,390  RR 1:2.0
 EMA20 (24,120) > EMA50 (24,050) RSI 67.1 — bullish momentum.
 RSI (Overbought): RSI 67.1 overbought zone, momentum confirmed; RSI trending up.
-OC (27-Jun, PCR 1.26): PCR 1.26 bullish; open air to CE wall at 24,400 (1.8% away).
-[Monthly 31-Jul: Monthly PCR 0.71 — bearish backdrop].
+OC (14-Jul, PCR 1.26): PCR 1.26 bullish; open air to CE wall at 24,400 (1.8% away).
+[Monthly 28-Jul: Monthly PCR 0.71 — bearish backdrop].
 Breadth confirms: 7/10 heavyweights advancing (HDFCBANK, INFY, TCS).
 
 Analysis: EMA20 crossed above EMA50 on an expanding bullish bar — Al Brooks
 calls this an EMA Pullback Entry. PCR above 1.2 indicates aggressive put
-writing at lower strikes, confirming institutional bullish bias. Monthly CE
-wall at 24,650 leaves ~2.2% upside before hitting structural resistance.
+writing at lower strikes, confirming institutional bullish bias.
 Key risk: if RSI turns below 60 on the next bar, momentum is fading — exit.
+────────────────────────
+⏸ VWAP_Breakout — HOLD (50%)
+[No trade — HOLD]
+No confirmed VWAP breakout. Close=24,120, VWAP=24,095 (+0.10%).
 ```
+Both weekly and monthly prices come from whichever tier actually produced them (Upstox
+live → NSE scrape → synthetic) — if it's a theoretical estimate rather than a real
+traded premium, the label reads `(Weekly, Est.)` / `(Monthly, Est.)` instead.
 
 ### Run tests
 ```bash
 python -m pytest tests/ -v
-# 193 tests, 82%+ coverage
+# 250+ tests, ~79% coverage
 ```
 
 ---
 
 ## What You Receive
 
-### Without API key (free)
+### Without any optional keys (free)
 - Morning report: global markets, NIFTY 50 A/D, weekly OC, monthly OC, news
-- 5-min intraday signals with full 4-layer confidence scoring
+- 5-min intraday signals for NIFTY + SENSEX, 2 strategies each, full 4-layer confidence scoring
+- Option chain prices via NSE scrape / VIX-based synthetic estimate (clearly labelled if not live)
 - Risk parameters (SL, target, RR)
 - Streamlit dashboard
-- No Claude AI explanations
-- No Claude daily trading plan
+- No Claude AI explanations, no Claude daily trading plan
 
-### With API key (~$0.05–0.20/day)
+### With Upstox configured (free)
 All of the above, plus:
-- Book-grounded signal explanation (references Al Brooks, Bulkowski, etc.)
+- **Real live weekly + monthly option premiums** for both NIFTY and SENSEX instead of estimates
+
+### With Anthropic API key (~$0.05–0.20/day)
+All of the above, plus:
+- Book-grounded signal explanation (references Al Brooks, Bulkowski, etc.) — generated per strategy
 - Claude daily trading plan at 8 AM (HIGH priority alert, bypasses silent mode)
 
 ---
@@ -588,20 +700,26 @@ When a signal fires, Claude receives the 4 most relevant patterns from your libr
 
 ```
 market_analysyis/
-├── main.py                              # Entry point + scheduler
-├── requirements.txt
+├── main.py                              # Entry point + scheduler (NIFTY + SENSEX)
+├── requirements.txt                     # includes playwright (NSE scrape fallback)
 ├── pytest.ini
 ├── .env                                 # Secrets (gitignored)
 ├── .env.example                         # Template
 ├── .gitignore
 │
+├── scripts/
+│   └── upstox_login.py                  # Daily Upstox access-token refresh helper
+│
 ├── nifty_ai_agent/
-│   ├── config.py                        # Pydantic settings
+│   ├── config.py                        # Pydantic settings (incl. Upstox)
 │   │
 │   ├── data/
 │   │   ├── base.py                      # MarketDataProvider + OptionChainData (weekly + monthly)
-│   │   ├── nse_provider.py              # NSE API + yfinance  [weekly + monthly expiry]
-│   │   ├── breadth.py                   # Live breadth — top 10 heavyweights  [NEW]
+│   │   ├── upstox_provider.py           # Live option chain — NIFTY + SENSEX  [NEW]
+│   │   ├── nse_provider.py              # NIFTY: Upstox → NSE scrape → VIX synthetic (4 tiers)
+│   │   ├── bse_provider.py              # SENSEX: Upstox → VIX synthetic
+│   │   ├── breadth.py                   # Live breadth — top 10 heavyweights
+│   │   ├── sensex_breadth.py            # SENSEX breadth equivalent
 │   │   ├── market_context.py            # Global indices + GIFT Nifty
 │   │   ├── news_fetcher.py              # RSS news (4 feeds)
 │   │   └── nifty50_stocks.py            # NIFTY 50 constituent movers
@@ -611,44 +729,50 @@ market_analysyis/
 │   │
 │   ├── strategies/
 │   │   ├── base.py                      # BaseStrategy, Signal, SignalType
-│   │   ├── ema_crossover.py             # Primary signal strategy
-│   │   ├── rsi_analyser.py              # RSI zone + trend + divergence  [NEW]
-│   │   └── option_analyser.py           # Weekly + monthly OC analysis  [EXTENDED]
+│   │   ├── ema_crossover.py             # Strategy 1 — EMA crossover + RSI
+│   │   ├── vwap_breakout.py             # Strategy 2 — VWAP breakout + momentum  [NEW]
+│   │   ├── rsi_analyser.py              # RSI zone + trend + divergence
+│   │   └── option_analyser.py           # Weekly + monthly OC analysis, is_live flag
 │   │
 │   ├── risk/
 │   │   └── calculator.py                # ATR-based SL/Target/RR
 │   │
 │   ├── ai/
 │   │   ├── knowledge_base.py            # 23 patterns from 6 books
-│   │   ├── explainer.py                 # Signal explanation via Claude
-│   │   └── morning_analyser.py          # Daily plan via Claude  [monthly OC context]
+│   │   ├── explainer.py                 # Signal explanation via Claude (per strategy)
+│   │   └── morning_analyser.py          # Daily plan via Claude
 │   │
 │   ├── database/
 │   │   ├── models.py                    # SQLAlchemy ORM
 │   │   └── repository.py                # CRUD operations
 │   │
 │   ├── notifier/
-│   │   └── pushover.py                  # Pushover HTTP API
+│   │   └── pushover.py                  # send_multi_signal() — all strategies, one message
 │   │
 │   └── reports/
-│       └── morning_report.py            # 8 AM orchestrator  [sends monthly OC message]
+│       └── morning_report.py            # 8 AM orchestrator
 │
 ├── dashboard/
-│   └── app.py                           # Streamlit dashboard
+│   └── app.py                           # Streamlit — per-strategy prediction cards
 │
-└── tests/                               # 193 tests, 82%+ coverage
+└── tests/                               # 250+ tests, ~79% coverage
     ├── test_indicators.py
     ├── test_strategies.py
+    ├── test_vwap_breakout.py            # [NEW]
     ├── test_risk.py
     ├── test_database.py
     ├── test_config.py
     ├── test_data_base.py
-    ├── test_nse_provider.py             # includes _identify_expiries + _compute_pcr tests
+    ├── test_nse_provider.py             # incl. Upstox wiring + skip-expiring-today
+    ├── test_bse_provider.py             # [NEW]
+    ├── test_upstox_provider.py          # [NEW]
+    ├── test_main_option_estimate.py     # [NEW] synthetic monthly-expiry date math
     ├── test_ai_explainer.py
     ├── test_knowledge_base.py
-    ├── test_option_analyser.py          # includes weekly + monthly OC confidence tests
-    ├── test_rsi_analyser.py             # zone, trend, divergence, adjustment  [NEW]
-    ├── test_breadth.py                  # heavyweight advance/decline  [NEW]
+    ├── test_option_analyser.py
+    ├── test_rsi_analyser.py
+    ├── test_breadth.py
+    ├── test_notifier.py                 # incl. weekly+monthly dual pricing, Est. labels
     ├── test_news_and_context.py
     └── test_morning_report.py
 ```
@@ -664,7 +788,8 @@ market_analysyis/
 - **PCR trend** — 5-session PCR moving average to identify momentum in put/call writing
 
 ### Phase 3 — Multi-Strategy Engine
-- **Strategy ranking** — score EMA crossover, VPA, and pattern strategies; only alert when ≥ 2 agree
+- ✅ **Two independent strategies** — EMA Crossover + VWAP Breakout, both run every cycle, saved and notified separately *(done)*
+- **Strategy ranking** — score all strategies; only alert (or boost confidence) when ≥ 2 agree
 - **Volume-Price Analysis strategy** — implement Coulling's effort-vs-result as a standalone signal module
 - **Chart pattern detection** — programmatically detect Bulkowski patterns (flags, triangles, double bottoms)
 - **Multi-timeframe confirmation** — require 15-min and 5-min agreement before firing
@@ -683,16 +808,19 @@ market_analysyis/
 - **Paper trading tracker** — log your manual trades against signals; calculate real P/L and win rate
 
 ### Phase 6 — Broker Integration
-- **Zerodha Kite API** — display live option contract prices for the specific CE/PE to trade
+- ✅ **Upstox API** — live option contract prices (weekly + monthly) for the specific CE/PE to trade, for both NIFTY and SENSEX *(done)*
 - **Order preview** — generate the exact order parameters but require manual confirmation to place
+- **Automated daily token refresh** — currently a manual `scripts/upstox_login.py` run each morning; could be scripted around market-open time
 
 ---
 
 ## Security Notes
-- `.env` is in `.gitignore` — never committed
+- `.env` is in `.gitignore` — never committed (Upstox/Pushover/Anthropic keys all live here)
+- `.venv/` and `.idea/` are gitignored too — keep local environments and IDE config out of version control
 - Logs never record API key values — only key presence
-- SQLite file excluded from git
-- Pushover credentials only read at runtime via `get_settings()`
+- Pushover and Upstox credentials only read at runtime via `get_settings()`
+- **Upstox access tokens expire nightly** (~3:30 AM IST) — a leaked token has a short shelf life, but treat `.env` as sensitive regardless
+- ⚠️ This repository currently tracks `nifty_ai_agent.db` (SQLite) in git — if the repo is public, anyone can see your accumulated signal history. Add `*.db` back to `.gitignore` and `git rm --cached nifty_ai_agent.db` if you'd rather keep that private.
 
 ---
 
