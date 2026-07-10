@@ -13,6 +13,74 @@ def provider():
     return BSEDataProvider(symbol="^BSESN")
 
 
+class TestGetSpotData:
+    def test_uses_upstox_when_token_configured(self):
+        provider = BSEDataProvider(symbol="^BSESN", upstox_access_token="fake-token")
+        mock_spot = MagicMock()
+        with patch.object(provider, "_get_spot_data_via_upstox", return_value=mock_spot) as mock_upstox:
+            with patch("yfinance.Ticker") as mock_yf:
+                spot = provider.get_spot_data()
+
+        mock_upstox.assert_called_once()
+        mock_yf.assert_not_called()
+        assert spot is mock_spot
+
+    def test_falls_back_to_yfinance_when_upstox_fails(self):
+        provider = BSEDataProvider(symbol="^BSESN", upstox_access_token="fake-token")
+        mock_ticker = MagicMock()
+        mock_ticker.fast_info.last_price = 77000.0
+        hist_df = pd.DataFrame({
+            "Open": [77000.0], "High": [77100.0], "Low": [76900.0],
+            "Close": [77050.0], "Volume": [0],
+        })
+        mock_ticker.history.return_value = hist_df
+        with patch.object(provider, "_get_spot_data_via_upstox", side_effect=RuntimeError("boom")):
+            with patch("yfinance.Ticker", return_value=mock_ticker):
+                spot = provider.get_spot_data()
+        assert spot.price == 77000.0
+
+    def test_via_upstox_builds_spot_data(self):
+        provider = BSEDataProvider(symbol="^BSESN", upstox_access_token="fake-token")
+        mock_client = MagicMock()
+        mock_client.get_quote.return_value = {
+            "price": 77430.18, "open": 77395.63, "high": 77526.85, "low": 77320.56, "volume": 0.0,
+        }
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            spot = provider._get_spot_data_via_upstox()
+        assert spot.price == 77430.18
+        mock_client.get_quote.assert_called_once_with("SENSEX")
+
+
+class TestGetHistoricalData:
+    def test_uses_upstox_when_token_configured(self):
+        provider = BSEDataProvider(symbol="^BSESN", upstox_access_token="fake-token")
+        mock_df = pd.DataFrame({"open": [1], "high": [1], "low": [1], "close": [1], "volume": [0]})
+        mock_client = MagicMock()
+        mock_client.get_historical_ohlcv.return_value = mock_df
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            with patch("yfinance.download") as mock_yf:
+                df = provider.get_historical_data(days=10, interval="5m")
+
+        mock_yf.assert_not_called()
+        mock_client.get_historical_ohlcv.assert_called_once_with("SENSEX", days=10, interval="5m")
+        assert df is mock_df
+
+    def test_falls_back_to_yfinance_when_upstox_fails(self):
+        provider = BSEDataProvider(symbol="^BSESN", upstox_access_token="fake-token")
+        hist = pd.DataFrame({
+            "Open": [77000.0] * 10, "High": [77100.0] * 10, "Low": [76900.0] * 10,
+            "Close": [77050.0] * 10, "Volume": [0] * 10,
+        })
+        mock_client = MagicMock()
+        mock_client.get_historical_ohlcv.side_effect = RuntimeError("boom")
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            with patch("yfinance.download", return_value=hist):
+                df = provider.get_historical_data(days=10)
+
+        assert isinstance(df, pd.DataFrame)
+        assert "close" in df.columns
+
+
 class TestGetOptionChain:
     def test_uses_upstox_when_token_configured(self):
         provider = BSEDataProvider(symbol="^BSESN", upstox_access_token="fake-token")
@@ -52,7 +120,7 @@ class TestGetOptionChain:
                             "pe_ltp": 540.0, "ce_iv": 13.0, "pe_iv": 12.5}]),
         ]
 
-        with patch("nifty_ai_agent.data.upstox_provider.UpstoxOptionChainClient", return_value=mock_client):
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
             chain = provider._fetch_option_chain_via_upstox()
 
         assert chain.symbol == "SENSEX"
@@ -67,7 +135,7 @@ class TestGetOptionChain:
         provider = BSEDataProvider(symbol="^BSESN", upstox_access_token="fake-token")
         mock_client = MagicMock()
         mock_client.get_expiries.return_value = []
-        with patch("nifty_ai_agent.data.upstox_provider.UpstoxOptionChainClient", return_value=mock_client):
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
             with pytest.raises(RuntimeError):
                 provider._fetch_option_chain_via_upstox()
 

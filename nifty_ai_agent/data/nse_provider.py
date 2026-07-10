@@ -82,6 +82,16 @@ class NSEDataProvider(MarketDataProvider):
     # ── Public interface ────────────────────────────────────────────
 
     def get_spot_data(self) -> SpotData:
+        """Fetch live spot price — Upstox first (if configured), then yfinance."""
+        if self._upstox_token:
+            try:
+                return self._get_spot_data_via_upstox()
+            except Exception as exc:
+                logger.warning(
+                    "Upstox spot fetch failed (%s: %s) — falling back to yfinance",
+                    type(exc).__name__, exc,
+                )
+
         logger.info("Fetching NIFTY spot data via yfinance")
 
         def _fetch() -> SpotData:
@@ -102,6 +112,21 @@ class NSEDataProvider(MarketDataProvider):
             )
 
         return _retry(_fetch)
+
+    def _get_spot_data_via_upstox(self) -> SpotData:
+        from nifty_ai_agent.data.upstox_provider import UpstoxClient
+
+        quote = UpstoxClient(self._upstox_token).get_quote("NIFTY")
+        logger.info("NIFTY spot fetched via Upstox (live): %.2f", quote["price"])
+        return SpotData(
+            symbol=self._symbol,
+            price=quote["price"],
+            timestamp=datetime.now(tz=timezone.utc),
+            open=quote["open"],
+            high=quote["high"],
+            low=quote["low"],
+            volume=int(quote["volume"]),
+        )
 
     def get_option_chain(self) -> OptionChainData:
         """Fetch the live option chain; fall back to a VIX-based synthetic estimate.
@@ -152,9 +177,9 @@ class NSEDataProvider(MarketDataProvider):
 
     def _fetch_option_chain_via_upstox(self) -> OptionChainData:
         """Fetch weekly + monthly option chains from Upstox's authenticated API."""
-        from nifty_ai_agent.data.upstox_provider import UpstoxOptionChainClient
+        from nifty_ai_agent.data.upstox_provider import UpstoxClient
 
-        client = UpstoxOptionChainClient(self._upstox_token)
+        client = UpstoxClient(self._upstox_token)
         expiries_iso = client.get_expiries("NIFTY")
         if not expiries_iso:
             raise RuntimeError("Upstox returned no expiry dates")
@@ -329,12 +354,25 @@ class NSEDataProvider(MarketDataProvider):
         )
 
     def get_historical_data(self, days: int = 60, interval: str = "5m") -> pd.DataFrame:
-        """Fetch OHLCV data.
+        """Fetch OHLCV data — Upstox first (if configured), then yfinance.
 
-        For live intraday signals use interval="5m" (default) — yfinance supports
-        up to 60 days of 5-minute data, giving enough bars for EMA50 calculation.
-        Use interval="1d" for end-of-day / backtesting workflows.
+        For live intraday signals use interval="5m" (default). Use interval="1d"
+        for end-of-day / backtesting workflows.
         """
+        if self._upstox_token:
+            try:
+                from nifty_ai_agent.data.upstox_provider import UpstoxClient
+                df = UpstoxClient(self._upstox_token).get_historical_ohlcv(
+                    "NIFTY", days=days, interval=interval,
+                )
+                logger.info("NIFTY OHLCV fetched via Upstox (live): %d bars", len(df))
+                return df
+            except Exception as exc:
+                logger.warning(
+                    "Upstox historical fetch failed (%s: %s) — falling back to yfinance",
+                    type(exc).__name__, exc,
+                )
+
         logger.info(
             "Fetching %d days of NIFTY OHLCV history via yfinance (interval=%s)",
             days, interval,

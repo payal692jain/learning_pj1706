@@ -16,9 +16,9 @@ from nifty_ai_agent.strategies.option_analyser import (
 )
 
 
-def _make_chain(spot: float = 24050.0, n_strikes: int = 10) -> pd.DataFrame:
-    atm = round(spot / 50) * 50
-    strikes = [atm + (i - n_strikes // 2) * 50 for i in range(n_strikes)]
+def _make_chain(spot: float = 24050.0, n_strikes: int = 10, strike_step: int = 50) -> pd.DataFrame:
+    atm = round(spot / strike_step) * strike_step
+    strikes = [atm + (i - n_strikes // 2) * strike_step for i in range(n_strikes)]
     rows = []
     for k in strikes:
         dist = abs(k - spot)
@@ -44,6 +44,14 @@ class TestNearestATM:
 
     def test_high_value(self):
         assert _nearest_atm(24380.0) == 24400
+
+    def test_custom_strike_step_for_sensex(self):
+        # SENSEX strikes are multiples of 100 — the bug this guards against:
+        # using the NIFTY default (50) here would round to 77550, which never
+        # exists in a real SENSEX chain, silently zeroing the ATM price lookup.
+        assert _nearest_atm(77524.25, strike_step=100) == 77500
+        assert _nearest_atm(77550.0, strike_step=100) == 77600
+        assert _nearest_atm(77550.0, strike_step=50) == 77550  # default-step behaviour unchanged
 
 
 class TestNormCDF:
@@ -132,6 +140,31 @@ class TestAnalyseOptionChain:
     def test_empty_chain_returns_stub(self):
         result = analyse_option_chain(pd.DataFrame(), 24000.0, "27-Jun-2024")
         assert result.atm_strike == 24000
+
+    def test_empty_chain_stub_respects_strike_step(self):
+        result = analyse_option_chain(pd.DataFrame(), 77524.25, "27-Jun-2024", strike_step=100)
+        assert result.atm_strike == 77500
+
+    def test_sensex_like_chain_matches_atm_with_correct_strike_step(self):
+        # Regression test: spot=77550 rounds to 77550 at the NIFTY default
+        # step (50), which never exists in a real 100-point SENSEX chain —
+        # that silently zeroed out atm_ce_ltp/atm_pe_ltp in production,
+        # showing "@ market price" in the notification instead of a real
+        # premium. Passing the real strike_step must fix the ATM match.
+        chain = _make_chain(spot=77550.0, strike_step=100)
+        result = analyse_option_chain(chain, 77550.0, "27-Jun-2024", strike_step=100)
+        assert result.atm_strike in chain["strike"].values
+        assert result.atm_ce_ltp > 0
+        assert result.atm_pe_ltp > 0
+
+    def test_wrong_strike_step_breaks_atm_match(self):
+        # Same scenario but WITHOUT the fix (default step=50 on a 100-point
+        # chain) — documents the exact failure mode this guards against.
+        chain = _make_chain(spot=77550.0, strike_step=100)
+        result = analyse_option_chain(chain, 77550.0, "27-Jun-2024")  # no strike_step passed
+        assert result.atm_strike not in chain["strike"].values
+        assert result.atm_ce_ltp == 0
+        assert result.atm_pe_ltp == 0
 
     def test_theoretical_prices_positive(self):
         result = analyse_option_chain(_make_chain(24000.0), 24000.0, "27-Jun-2024")

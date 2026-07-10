@@ -1,7 +1,6 @@
 """Application configuration — loaded from environment / .env file."""
 
 import logging
-from functools import lru_cache
 from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
@@ -66,8 +65,14 @@ class Settings(BaseSettings):
     log_file: str = Field(default="nifty_ai_agent/logs/agent.log", description="Log file path")
 
 
-@lru_cache(maxsize=1)
 def get_settings() -> Settings:
+    """Re-read `.env` on every call.
+
+    Intentionally not cached: UPSTOX_ACCESS_TOKEN is refreshed daily by
+    scripts/upstox_login.py while the agent keeps running for days at a
+    time — a cached Settings object would freeze that token (and any other
+    .env edit) at whatever it was when the process started.
+    """
     return Settings()
 
 

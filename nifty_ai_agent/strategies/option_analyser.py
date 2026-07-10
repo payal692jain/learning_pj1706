@@ -49,24 +49,28 @@ def analyse_option_chain(
     spot: float,
     expiry: str,
     strikes_each_side: int = 3,
+    strike_step: int = _STRIKE_STEP,
 ) -> ExpiryAnalysis:
     """Analyse the option chain and return a structured weekly expiry report.
 
     Args:
         option_chain: DataFrame with columns: strike, ce_oi, pe_oi, ce_ltp, pe_ltp, ce_iv, pe_iv
-        spot: Current NIFTY spot price.
+        spot: Current index spot price.
         expiry: Expiry date string (e.g. "27-Jun-2024").
         strikes_each_side: How many strikes above and below ATM to include.
+        strike_step: Strike price interval — 50 for NIFTY, 100 for SENSEX. Getting
+            this wrong means the computed ATM strike never matches a real row in
+            *option_chain*, silently zeroing out the live/theoretical ATM price.
     """
     if option_chain.empty:
         logger.warning("Empty option chain — returning stub analysis")
-        return _stub_analysis(spot, expiry)
+        return _stub_analysis(spot, expiry, strike_step)
 
     df = option_chain.copy()
     df = df.sort_values("strike").reset_index(drop=True)
 
     # ATM = nearest strike to spot
-    atm_strike = _nearest_atm(spot)
+    atm_strike = _nearest_atm(spot, strike_step)
     df["is_atm"] = df["strike"] == atm_strike
 
     # PCR and max pain
@@ -83,7 +87,7 @@ def analyse_option_chain(
 
     # Select ATM ± N strikes
     strikes_window = [
-        atm_strike + i * _STRIKE_STEP
+        atm_strike + i * strike_step
         for i in range(-strikes_each_side, strikes_each_side + 1)
     ]
     window_df = df[df["strike"].isin(strikes_window)]
@@ -276,8 +280,8 @@ def monthly_option_chain_note(
 
 # ── Helpers ────────────────────────────────────────────────────────────────────
 
-def _nearest_atm(spot: float) -> int:
-    return int(round(spot / _STRIKE_STEP) * _STRIKE_STEP)
+def _nearest_atm(spot: float, strike_step: int = _STRIKE_STEP) -> int:
+    return int(round(spot / strike_step) * strike_step)
 
 
 def _compute_max_pain(df: pd.DataFrame) -> float:
@@ -459,13 +463,14 @@ def compute_atm_theoretical_prices(
     return round(ce, 1), round(pe, 1)
 
 
-def _stub_analysis(spot: float, expiry: str) -> ExpiryAnalysis:
+def _stub_analysis(spot: float, expiry: str, strike_step: int = _STRIKE_STEP) -> ExpiryAnalysis:
+    atm = _nearest_atm(spot, strike_step)
     return ExpiryAnalysis(
         expiry=expiry, spot=spot,
-        atm_strike=_nearest_atm(spot),
+        atm_strike=atm,
         max_pain=spot, pcr=1.0, legs=[],
-        call_oi_resistance=_nearest_atm(spot) + 200,
-        put_oi_support=_nearest_atm(spot) - 200,
+        call_oi_resistance=atm + strike_step * 4,
+        put_oi_support=atm - strike_step * 4,
         bias="NEUTRAL",
         is_live=False,
     )

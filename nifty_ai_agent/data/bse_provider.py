@@ -67,6 +67,16 @@ class BSEDataProvider(MarketDataProvider):
     # ── Public interface ────────────────────────────────────────────
 
     def get_spot_data(self) -> SpotData:
+        """Fetch live spot price — Upstox first (if configured), then yfinance."""
+        if self._upstox_token:
+            try:
+                return self._get_spot_data_via_upstox()
+            except Exception as exc:
+                logger.warning(
+                    "Upstox SENSEX spot fetch failed (%s: %s) — falling back to yfinance",
+                    type(exc).__name__, exc,
+                )
+
         logger.info("Fetching SENSEX spot data via yfinance")
 
         def _fetch() -> SpotData:
@@ -87,6 +97,21 @@ class BSEDataProvider(MarketDataProvider):
             )
 
         return _retry(_fetch)
+
+    def _get_spot_data_via_upstox(self) -> SpotData:
+        from nifty_ai_agent.data.upstox_provider import UpstoxClient
+
+        quote = UpstoxClient(self._upstox_token).get_quote("SENSEX")
+        logger.info("SENSEX spot fetched via Upstox (live): %.2f", quote["price"])
+        return SpotData(
+            symbol=self._symbol,
+            price=quote["price"],
+            timestamp=datetime.now(tz=timezone.utc),
+            open=quote["open"],
+            high=quote["high"],
+            low=quote["low"],
+            volume=int(quote["volume"]),
+        )
 
     def get_option_chain(self) -> OptionChainData:
         """Fetch the live SENSEX option chain via Upstox; fall back to a VIX estimate.
@@ -112,9 +137,9 @@ class BSEDataProvider(MarketDataProvider):
 
     def _fetch_option_chain_via_upstox(self) -> OptionChainData:
         """Fetch weekly + monthly SENSEX option chains from Upstox's authenticated API."""
-        from nifty_ai_agent.data.upstox_provider import UpstoxOptionChainClient
+        from nifty_ai_agent.data.upstox_provider import UpstoxClient
 
-        client = UpstoxOptionChainClient(self._upstox_token)
+        client = UpstoxClient(self._upstox_token)
         expiries_iso = client.get_expiries("SENSEX")
         if not expiries_iso:
             raise RuntimeError("Upstox returned no expiry dates for SENSEX")
@@ -142,6 +167,21 @@ class BSEDataProvider(MarketDataProvider):
         )
 
     def get_historical_data(self, days: int = 60, interval: str = "5m") -> pd.DataFrame:
+        """Fetch OHLCV data — Upstox first (if configured), then yfinance."""
+        if self._upstox_token:
+            try:
+                from nifty_ai_agent.data.upstox_provider import UpstoxClient
+                df = UpstoxClient(self._upstox_token).get_historical_ohlcv(
+                    "SENSEX", days=days, interval=interval,
+                )
+                logger.info("SENSEX OHLCV fetched via Upstox (live): %d bars", len(df))
+                return df
+            except Exception as exc:
+                logger.warning(
+                    "Upstox SENSEX historical fetch failed (%s: %s) — falling back to yfinance",
+                    type(exc).__name__, exc,
+                )
+
         logger.info(
             "Fetching %d days of SENSEX OHLCV via yfinance (interval=%s)", days, interval
         )

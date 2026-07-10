@@ -69,6 +69,64 @@ class TestNSEDataProvider:
         assert "close" in df.columns
         assert len(df) <= 60
 
+    def test_get_spot_data_uses_upstox_when_token_configured(self):
+        provider = NSEDataProvider(symbol="^NSEI", upstox_access_token="fake-token")
+        mock_spot = MagicMock()
+        with patch.object(provider, "_get_spot_data_via_upstox", return_value=mock_spot) as mock_upstox:
+            with patch("yfinance.Ticker") as mock_yf:
+                spot = provider.get_spot_data()
+
+        mock_upstox.assert_called_once()
+        mock_yf.assert_not_called()
+        assert spot is mock_spot
+
+    def test_get_spot_data_falls_back_to_yfinance_when_upstox_fails(self):
+        provider = NSEDataProvider(symbol="^NSEI", upstox_access_token="fake-token")
+        mock_ticker = MagicMock()
+        mock_ticker.fast_info.last_price = 24000.0
+        mock_ticker.history.return_value = _mock_hist_df(5)
+        with patch.object(provider, "_get_spot_data_via_upstox", side_effect=RuntimeError("boom")):
+            with patch("yfinance.Ticker", return_value=mock_ticker):
+                spot = provider.get_spot_data()
+        assert spot.price == 24000.0
+
+    def test_get_spot_data_via_upstox_builds_spot_data(self):
+        provider = NSEDataProvider(symbol="^NSEI", upstox_access_token="fake-token")
+        mock_client = MagicMock()
+        mock_client.get_quote.return_value = {
+            "price": 24171.1, "open": 24124.7, "high": 24187.9, "low": 24120.35, "volume": 0.0,
+        }
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            spot = provider._get_spot_data_via_upstox()
+        assert spot.price == 24171.1
+        assert spot.symbol == "^NSEI"
+        mock_client.get_quote.assert_called_once_with("NIFTY")
+
+    def test_get_historical_data_uses_upstox_when_token_configured(self):
+        provider = NSEDataProvider(symbol="^NSEI", upstox_access_token="fake-token")
+        mock_df = pd.DataFrame({"open": [1], "high": [1], "low": [1], "close": [1], "volume": [0]})
+        mock_client = MagicMock()
+        mock_client.get_historical_ohlcv.return_value = mock_df
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            with patch("yfinance.download") as mock_yf:
+                df = provider.get_historical_data(days=10, interval="5m")
+
+        mock_yf.assert_not_called()
+        mock_client.get_historical_ohlcv.assert_called_once_with("NIFTY", days=10, interval="5m")
+        assert df is mock_df
+
+    def test_get_historical_data_falls_back_to_yfinance_when_upstox_fails(self):
+        provider = NSEDataProvider(symbol="^NSEI", upstox_access_token="fake-token")
+        hist = _mock_hist_df(60)
+        mock_client = MagicMock()
+        mock_client.get_historical_ohlcv.side_effect = RuntimeError("boom")
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            with patch("yfinance.download", return_value=hist):
+                df = provider.get_historical_data(days=60)
+
+        assert isinstance(df, pd.DataFrame)
+        assert "close" in df.columns
+
     def test_get_historical_data_empty_raises(self, provider):
         with patch("yfinance.download", return_value=pd.DataFrame()):
             with patch("time.sleep"):
@@ -231,7 +289,7 @@ class TestNSEDataProvider:
                             "pe_ltp": 233.0, "ce_iv": 13.0, "pe_iv": 12.5}]),
         ]
 
-        with patch("nifty_ai_agent.data.upstox_provider.UpstoxOptionChainClient", return_value=mock_client):
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
             chain = provider._fetch_option_chain_via_upstox()
 
         assert chain.expiry == "09-Jul-2026"

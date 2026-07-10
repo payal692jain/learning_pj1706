@@ -144,7 +144,9 @@ def _get_cached_option_analysis(
         # strike step, VIX-derived PCR, zero OI walls so only PCR fires,
         # and Black-Scholes theoretical prices so the notification shows a
         # real buy price instead of "@ market price".
-        weekly = analyse_option_chain(chain_data.strikes, spot, chain_data.expiry)
+        weekly = analyse_option_chain(
+            chain_data.strikes, spot, chain_data.expiry, strike_step=index.strike_step,
+        )
         monthly: ExpiryAnalysis | None = None
 
         if chain_data.strikes.empty and chain_data.pcr > 0:
@@ -206,6 +208,7 @@ def _get_cached_option_analysis(
             monthly = analyse_option_chain(
                 chain_data.monthly_strikes, spot,
                 chain_data.monthly_expiry, strikes_each_side=5,
+                strike_step=index.strike_step,
             )
 
         cache["weekly"] = weekly
@@ -526,8 +529,11 @@ def main() -> None:
             symbol=settings.nifty_symbol,
             strike_step=50,
             expiry_weekday=1,  # Tuesday — confirmed live via Upstox; NSE moved NIFTY off Thursday
-            make_provider=lambda s=settings.nifty_symbol, t=settings.upstox_access_token: (
-                NSEDataProvider(symbol=s, upstox_access_token=t)
+            # Re-reads the token from get_settings() on every call (not captured as a
+            # default arg) so a daily scripts/upstox_login.py refresh takes effect
+            # without restarting the agent.
+            make_provider=lambda s=settings.nifty_symbol: (
+                NSEDataProvider(symbol=s, upstox_access_token=get_settings().upstox_access_token)
             ),
             fetch_breadth=fetch_realtime_breadth,
         ),
@@ -536,8 +542,8 @@ def main() -> None:
             symbol=settings.sensex_symbol,
             strike_step=100,
             expiry_weekday=3,  # Thursday — confirmed live via Upstox; BSE moved SENSEX off Friday
-            make_provider=lambda s=settings.sensex_symbol, t=settings.upstox_access_token: (
-                BSEDataProvider(symbol=s, upstox_access_token=t)
+            make_provider=lambda s=settings.sensex_symbol: (
+                BSEDataProvider(symbol=s, upstox_access_token=get_settings().upstox_access_token)
             ),
             fetch_breadth=fetch_sensex_breadth,
         ),
