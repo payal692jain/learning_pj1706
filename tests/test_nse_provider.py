@@ -300,6 +300,95 @@ class TestNSEDataProvider:
         mock_client.get_option_chain.assert_any_call("NIFTY", "2026-07-30")
 
 
+class TestBankNiftySupport:
+    """NSEDataProvider must be reusable for any NSE index, not just NIFTY."""
+
+    def _provider(self, upstox_access_token: str = "") -> NSEDataProvider:
+        return NSEDataProvider(
+            symbol="^NSEBANK", upstox_access_token=upstox_access_token,
+            index_name="BANKNIFTY", strike_step=100,
+        )
+
+    def test_upstox_fetch_uses_banknifty_index_name(self):
+        provider = self._provider(upstox_access_token="fake-token")
+        mock_client = MagicMock()
+        mock_client.get_expiries.return_value = ["2026-07-28"]
+        mock_client.get_option_chain.return_value = pd.DataFrame(
+            [{"strike": 57900, "ce_oi": 1, "pe_oi": 1, "ce_ltp": 800.0,
+              "pe_ltp": 700.0, "ce_iv": 12.0, "pe_iv": 11.0}]
+        )
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            chain = provider._fetch_option_chain_via_upstox()
+
+        mock_client.get_expiries.assert_called_once_with("BANKNIFTY")
+        mock_client.get_option_chain.assert_any_call("BANKNIFTY", "2026-07-28")
+        assert chain.symbol == "BANKNIFTY"
+
+    def test_spot_via_upstox_uses_banknifty_index_name(self):
+        provider = self._provider(upstox_access_token="fake-token")
+        mock_client = MagicMock()
+        mock_client.get_quote.return_value = {
+            "price": 57923.1, "open": 57800.0, "high": 58000.0, "low": 57700.0, "volume": 0.0,
+        }
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            spot = provider._get_spot_data_via_upstox()
+
+        mock_client.get_quote.assert_called_once_with("BANKNIFTY")
+        assert spot.price == 57923.1
+        assert spot.symbol == "^NSEBANK"
+
+    def test_historical_via_upstox_uses_banknifty_index_name(self):
+        provider = self._provider(upstox_access_token="fake-token")
+        mock_df = pd.DataFrame({"open": [1], "high": [1], "low": [1], "close": [1], "volume": [0]})
+        mock_client = MagicMock()
+        mock_client.get_historical_ohlcv.return_value = mock_df
+        with patch("nifty_ai_agent.data.upstox_provider.UpstoxClient", return_value=mock_client):
+            df = provider.get_historical_data(days=10, interval="5m")
+
+        mock_client.get_historical_ohlcv.assert_called_once_with("BANKNIFTY", days=10, interval="5m")
+        assert df is mock_df
+
+    def test_nse_scrape_url_uses_banknifty_symbol(self):
+        provider = self._provider()
+        with patch.object(provider, "_fetch_option_chain_json_http") as mock_http:
+            mock_http.return_value = {"records": {"expiryDates": [], "data": []}}
+            provider.get_option_chain()
+
+        called_url = mock_http.call_args[0][0]
+        assert "symbol=BANKNIFTY" in called_url
+
+    def test_parsed_option_chain_symbol_is_banknifty(self):
+        provider = self._provider()
+        mock_json = {
+            "records": {
+                "expiryDates": ["28-Jul-2026"],
+                "data": [{
+                    "strikePrice": 57900, "expiryDate": "28-Jul-2026",
+                    "CE": {"openInterest": 1, "lastPrice": 800.0, "impliedVolatility": 12.0},
+                    "PE": {"openInterest": 1, "lastPrice": 700.0, "impliedVolatility": 11.0},
+                }],
+            }
+        }
+        chain = provider._parse_option_chain_json(mock_json)
+        assert chain.symbol == "BANKNIFTY"
+
+    def test_synthetic_chain_uses_banknifty_strike_step(self):
+        provider = self._provider()
+        mock_spot_ticker = MagicMock()
+        mock_spot_ticker.fast_info.last_price = 57923.0
+        mock_vix_ticker = MagicMock()
+        mock_vix_ticker.fast_info.last_price = 14.0
+
+        def _ticker(symbol):
+            return mock_vix_ticker if symbol == "^INDIAVIX" else mock_spot_ticker
+
+        with patch("yfinance.Ticker", side_effect=_ticker):
+            chain = provider._synthetic_option_chain()
+
+        assert chain.symbol == "BANKNIFTY"
+        assert chain.max_pain % 100 == 0  # ATM rounded to the 100-point strike step
+
+
 class TestIsoDateConversion:
     def test_iso_to_nse_date(self):
         assert _iso_to_nse_date("2026-07-09") == "09-Jul-2026"

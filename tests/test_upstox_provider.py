@@ -67,7 +67,7 @@ class TestGetExpiries:
 
     def test_unknown_index_raises(self, client):
         with pytest.raises(ValueError):
-            client.get_expiries("BANKNIFTY")
+            client.get_expiries("FINNIFTY")
 
     def test_401_raises_auth_error(self, client):
         mock_resp = MagicMock()

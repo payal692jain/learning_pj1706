@@ -50,11 +50,19 @@ def _retry(fn, *args, retries: int = _RETRY_COUNT, delay: float = _RETRY_DELAY, 
 
 
 class NSEDataProvider(MarketDataProvider):
-    """Fetches NIFTY data from NSE (option chain) and yfinance (OHLCV)."""
+    """Fetches NSE index data (NIFTY, BANKNIFTY, ...) from NSE + yfinance + Upstox."""
 
-    def __init__(self, symbol: str = "^NSEI", upstox_access_token: str = "") -> None:
+    def __init__(
+        self,
+        symbol: str = "^NSEI",
+        upstox_access_token: str = "",
+        index_name: str = "NIFTY",
+        strike_step: int = _STRIKE_STEP,
+    ) -> None:
         self._symbol = symbol
         self._upstox_token = upstox_access_token
+        self._index_name = index_name
+        self._strike_step = strike_step
 
     # ── NSE session ────────────────────────────────────────────────
 
@@ -92,7 +100,7 @@ class NSEDataProvider(MarketDataProvider):
                     type(exc).__name__, exc,
                 )
 
-        logger.info("Fetching NIFTY spot data via yfinance")
+        logger.info("Fetching %s spot data via yfinance", self._index_name)
 
         def _fetch() -> SpotData:
             ticker = yf.Ticker(self._symbol)
@@ -116,8 +124,8 @@ class NSEDataProvider(MarketDataProvider):
     def _get_spot_data_via_upstox(self) -> SpotData:
         from nifty_ai_agent.data.upstox_provider import UpstoxClient
 
-        quote = UpstoxClient(self._upstox_token).get_quote("NIFTY")
-        logger.info("NIFTY spot fetched via Upstox (live): %.2f", quote["price"])
+        quote = UpstoxClient(self._upstox_token).get_quote(self._index_name)
+        logger.info("%s spot fetched via Upstox (live): %.2f", self._index_name, quote["price"])
         return SpotData(
             symbol=self._symbol,
             price=quote["price"],
@@ -141,12 +149,12 @@ class NSEDataProvider(MarketDataProvider):
              navigates straight to the JSON endpoint and reads its rendered text.
           4. VIX-based synthetic estimate — last resort if every live path fails.
         """
-        logger.info("Fetching NIFTY option chain")
+        logger.info("Fetching %s option chain", self._index_name)
 
         if self._upstox_token:
             try:
                 data = self._fetch_option_chain_via_upstox()
-                logger.info("NIFTY option chain fetched via Upstox (live)")
+                logger.info("%s option chain fetched via Upstox (live)", self._index_name)
                 return data
             except Exception as exc:
                 logger.warning(
@@ -154,7 +162,7 @@ class NSEDataProvider(MarketDataProvider):
                     type(exc).__name__, exc,
                 )
 
-        url = f"{_NSE_BASE}/api/option-chain-indices?symbol=NIFTY"
+        url = f"{_NSE_BASE}/api/option-chain-indices?symbol={self._index_name}"
         try:
             data = self._fetch_option_chain_json_http(url)
             logger.info("NSE option chain fetched via plain HTTP")
@@ -180,23 +188,23 @@ class NSEDataProvider(MarketDataProvider):
         from nifty_ai_agent.data.upstox_provider import UpstoxClient
 
         client = UpstoxClient(self._upstox_token)
-        expiries_iso = client.get_expiries("NIFTY")
+        expiries_iso = client.get_expiries(self._index_name)
         if not expiries_iso:
             raise RuntimeError("Upstox returned no expiry dates")
 
         expiry_dates_nse_fmt = [_iso_to_nse_date(d) for d in expiries_iso]
         weekly_expiry, monthly_expiry = _identify_expiries(expiry_dates_nse_fmt)
 
-        weekly_df = client.get_option_chain("NIFTY", _nse_date_to_iso(weekly_expiry))
+        weekly_df = client.get_option_chain(self._index_name, _nse_date_to_iso(weekly_expiry))
         monthly_df = pd.DataFrame()
         if monthly_expiry and monthly_expiry != weekly_expiry:
-            monthly_df = client.get_option_chain("NIFTY", _nse_date_to_iso(monthly_expiry))
+            monthly_df = client.get_option_chain(self._index_name, _nse_date_to_iso(monthly_expiry))
 
         weekly_pcr = _compute_pcr(weekly_df)
         weekly_max_pain = _compute_max_pain(weekly_df) if not weekly_df.empty else 0.0
 
         return OptionChainData(
-            symbol="NIFTY",
+            symbol=self._index_name,
             expiry=weekly_expiry,
             monthly_expiry=monthly_expiry if not monthly_df.empty else "",
             timestamp=datetime.now(tz=timezone.utc),
@@ -246,8 +254,7 @@ class NSEDataProvider(MarketDataProvider):
             finally:
                 browser.close()
 
-    @staticmethod
-    def _parse_option_chain_json(data: dict[str, Any]) -> OptionChainData:
+    def _parse_option_chain_json(self, data: dict[str, Any]) -> OptionChainData:
         """Split NSE's raw option-chain JSON into weekly/monthly strike DataFrames."""
         records = data.get("records", {})
         expiry_dates: list[str] = _drop_expiring_today(records.get("expiryDates", []))
@@ -286,7 +293,7 @@ class NSEDataProvider(MarketDataProvider):
             weekly_expiry, len(weekly_df), monthly_expiry, len(monthly_df),
         )
         return OptionChainData(
-            symbol="NIFTY",
+            symbol=self._index_name,
             expiry=weekly_expiry,
             monthly_expiry=monthly_expiry,
             timestamp=datetime.now(tz=timezone.utc),
@@ -334,15 +341,15 @@ class NSEDataProvider(MarketDataProvider):
         else:
             pcr = 1.55
 
-        atm = int(round(spot / _STRIKE_STEP) * _STRIKE_STEP) if spot else 24000
+        atm = int(round(spot / self._strike_step) * self._strike_step) if spot else 24000
         expiry = _next_weekly_expiry()
 
         logger.info(
-            "Synthetic chain: VIX=%.2f PCR=%.2f ATM=%d expiry=%s",
-            vix, pcr, atm, expiry,
+            "%s synthetic chain: VIX=%.2f PCR=%.2f ATM=%d expiry=%s",
+            self._index_name, vix, pcr, atm, expiry,
         )
         return OptionChainData(
-            symbol="NIFTY",
+            symbol=self._index_name,
             expiry=expiry,
             monthly_expiry="",
             timestamp=datetime.now(tz=timezone.utc),
@@ -363,9 +370,11 @@ class NSEDataProvider(MarketDataProvider):
             try:
                 from nifty_ai_agent.data.upstox_provider import UpstoxClient
                 df = UpstoxClient(self._upstox_token).get_historical_ohlcv(
-                    "NIFTY", days=days, interval=interval,
+                    self._index_name, days=days, interval=interval,
                 )
-                logger.info("NIFTY OHLCV fetched via Upstox (live): %d bars", len(df))
+                logger.info(
+                    "%s OHLCV fetched via Upstox (live): %d bars", self._index_name, len(df),
+                )
                 return df
             except Exception as exc:
                 logger.warning(
@@ -374,8 +383,8 @@ class NSEDataProvider(MarketDataProvider):
                 )
 
         logger.info(
-            "Fetching %d days of NIFTY OHLCV history via yfinance (interval=%s)",
-            days, interval,
+            "Fetching %d days of %s OHLCV history via yfinance (interval=%s)",
+            days, self._index_name, interval,
         )
 
         def _fetch() -> pd.DataFrame:

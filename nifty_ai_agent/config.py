@@ -38,6 +38,7 @@ class Settings(BaseSettings):
     # ── Market data ────────────────────────────────────────────
     nifty_symbol: str = Field(default="^NSEI", description="yfinance NIFTY symbol")
     sensex_symbol: str = Field(default="^BSESN", description="yfinance SENSEX symbol")
+    banknifty_symbol: str = Field(default="^NSEBANK", description="yfinance BANKNIFTY symbol")
     data_fetch_interval_minutes: int = Field(
         default=5, description="How often to run the signal loop"
     )

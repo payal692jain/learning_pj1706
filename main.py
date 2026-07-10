@@ -23,6 +23,7 @@ from datetime import date, datetime, timedelta
 
 from nifty_ai_agent.ai.explainer import SignalExplainer
 from nifty_ai_agent.config import configure_logging, get_settings
+from nifty_ai_agent.data.banknifty_breadth import fetch_banknifty_breadth
 from nifty_ai_agent.data.breadth import BreadthSnapshot, fetch_realtime_breadth
 from nifty_ai_agent.data.bse_provider import BSEDataProvider
 from nifty_ai_agent.data.nse_provider import NSEDataProvider
@@ -58,10 +59,10 @@ _MARKET_CLOSE_MINUTE = 30
 
 class IndexConfig(NamedTuple):
     """All index-specific settings needed to run a signal pipeline."""
-    name: str                              # "NIFTY" or "SENSEX"
+    name: str                              # "NIFTY", "SENSEX", or "BANKNIFTY"
     symbol: str                            # yfinance symbol
-    strike_step: int                       # 50 for NIFTY, 100 for SENSEX
-    expiry_weekday: int                    # 1=Tuesday (NIFTY), 3=Thursday (SENSEX)
+    strike_step: int                       # 50 for NIFTY, 100 for SENSEX/BANKNIFTY
+    expiry_weekday: int                    # 1=Tuesday (NIFTY, BANKNIFTY), 3=Thursday (SENSEX)
     make_provider: Callable                # factory → MarketDataProvider
     fetch_breadth: Callable[[], BreadthSnapshot]
 
@@ -547,10 +548,27 @@ def main() -> None:
             ),
             fetch_breadth=fetch_sensex_breadth,
         ),
+        IndexConfig(
+            name="BANKNIFTY",
+            symbol=settings.banknifty_symbol,
+            strike_step=100,
+            # Tuesday — confirmed live via Upstox. BANKNIFTY has no true weekly expiry
+            # anymore (SEBI's Nov-2024 rules left only one weekly per exchange, which
+            # NSE assigned to NIFTY) — BANKNIFTY is monthly-only, so "weekly" here
+            # really means "nearest available (monthly) contract."
+            expiry_weekday=1,
+            make_provider=lambda s=settings.banknifty_symbol: (
+                NSEDataProvider(
+                    symbol=s, upstox_access_token=get_settings().upstox_access_token,
+                    index_name="BANKNIFTY", strike_step=100,
+                )
+            ),
+            fetch_breadth=fetch_banknifty_breadth,
+        ),
     ])
 
     logger.info(
-        "NIFTY+SENSEX AI Agent starting — morning report @ 08:00 IST | "
+        "NIFTY+SENSEX+BANKNIFTY AI Agent starting — morning report @ 08:00 IST | "
         "intraday signals every %d min | indices: %s",
         settings.data_fetch_interval_minutes,
         ", ".join(c.name for c in _INDEX_CONFIGS),
@@ -564,7 +582,7 @@ def main() -> None:
         ).send_text(
             title="Market Agent Started",
             message=(
-                f"Tracking: NIFTY + SENSEX\n"
+                f"Tracking: {', '.join(c.name for c in _INDEX_CONFIGS)}\n"
                 f"Morning report @ 08:00 IST daily.\n"
                 f"Signals every {settings.data_fetch_interval_minutes} min "
                 f"(09:15–15:30 IST)."

@@ -5,10 +5,15 @@ from unittest.mock import MagicMock, patch
 import pytest
 import requests
 
-from nifty_ai_agent.notifier.pushover import PushoverNotifier, _PRIORITY_LOW, _PRIORITY_NORMAL
+from nifty_ai_agent.notifier.pushover import (
+    PushoverNotifier,
+    _PRIORITY_LOW,
+    _PRIORITY_NORMAL,
+    _find_itm_legs,
+)
 from nifty_ai_agent.risk.calculator import RiskCalculator
 from nifty_ai_agent.strategies.base import Signal, SignalType
-from nifty_ai_agent.strategies.option_analyser import ExpiryAnalysis
+from nifty_ai_agent.strategies.option_analyser import ExpiryAnalysis, OptionLeg
 
 
 def _dummy_signal(sig_type: SignalType = SignalType.BUY_CE) -> Signal:
@@ -40,6 +45,24 @@ def _dummy_expiry_analysis(
         atm_ce_ltp=atm_ce_ltp,
         atm_pe_ltp=atm_pe_ltp,
         is_live=is_live,
+    )
+
+
+def _leg(strike: int, ce_ltp: float, pe_ltp: float, is_atm: bool = False) -> OptionLeg:
+    return OptionLeg(
+        strike=strike, ce_ltp=ce_ltp, pe_ltp=pe_ltp,
+        ce_oi=1000, pe_oi=1000, ce_iv=15.0, pe_iv=14.0, is_atm=is_atm,
+    )
+
+
+def _expiry_analysis_with_legs(atm_strike: int, legs: list[OptionLeg]) -> ExpiryAnalysis:
+    return ExpiryAnalysis(
+        expiry="14-Jul-2026", spot=float(atm_strike), atm_strike=atm_strike,
+        max_pain=float(atm_strike), pcr=1.0, legs=legs,
+        call_oi_resistance=atm_strike + 200, put_oi_support=atm_strike - 200,
+        bias="NEUTRAL",
+        atm_ce_ltp=next((l.ce_ltp for l in legs if l.is_atm), 0.0),
+        atm_pe_ltp=next((l.pe_ltp for l in legs if l.is_atm), 0.0),
     )
 
 
@@ -181,6 +204,95 @@ class TestPushoverNotifier:
         )
         assert "Buy (Weekly):" in body
         assert "Est." not in body
+
+
+class TestFindItmLegs:
+    def test_finds_strike_below_and_above_atm(self):
+        legs = [
+            _leg(24300, ce_ltp=210.0, pe_ltp=40.0),
+            _leg(24350, ce_ltp=170.0, pe_ltp=55.0),
+            _leg(24400, ce_ltp=135.0, pe_ltp=75.0, is_atm=True),
+            _leg(24450, ce_ltp=100.0, pe_ltp=100.0),
+            _leg(24500, ce_ltp=70.0, pe_ltp=130.0),
+        ]
+        analysis = _expiry_analysis_with_legs(24400, legs)
+        itm_call, itm_put = _find_itm_legs(analysis)
+        assert itm_call.strike == 24350
+        assert itm_put.strike == 24450
+
+    def test_never_returns_the_atm_strike_itself(self):
+        # Regression: anchoring on spot (rather than the ATM strike) could
+        # return the same strike already shown on the ATM line, making the
+        # "ITM" line a confusing repeat. Spot sits just above the ATM strike
+        # here, which would trigger that bug if not anchored on ATM.
+        legs = [
+            _leg(24300, ce_ltp=210.0, pe_ltp=40.0),
+            _leg(24400, ce_ltp=135.0, pe_ltp=75.0, is_atm=True),
+            _leg(24500, ce_ltp=70.0, pe_ltp=130.0),
+        ]
+        analysis = _expiry_analysis_with_legs(24400, legs)
+        analysis.spot = 24417.0  # just above the ATM strike
+        itm_call, itm_put = _find_itm_legs(analysis)
+        assert itm_call.strike != analysis.atm_strike
+        assert itm_put.strike != analysis.atm_strike
+        assert itm_call.strike == 24300
+        assert itm_put.strike == 24500
+
+    def test_empty_legs_returns_none_none(self):
+        analysis = _expiry_analysis_with_legs(24400, [])
+        assert _find_itm_legs(analysis) == (None, None)
+
+    def test_no_strikes_below_atm(self):
+        legs = [_leg(24400, ce_ltp=135.0, pe_ltp=75.0, is_atm=True), _leg(24500, ce_ltp=70.0, pe_ltp=130.0)]
+        analysis = _expiry_analysis_with_legs(24400, legs)
+        itm_call, itm_put = _find_itm_legs(analysis)
+        assert itm_call is None
+        assert itm_put.strike == 24500
+
+
+class TestItmLinesInNotification:
+    def test_itm_ce_and_pe_shown_for_buy_ce_signal(self, notifier):
+        legs = [
+            _leg(24350, ce_ltp=178.0, pe_ltp=55.0),
+            _leg(24400, ce_ltp=142.0, pe_ltp=75.0, is_atm=True),
+            _leg(24450, ce_ltp=110.0, pe_ltp=95.0),
+        ]
+        weekly = _expiry_analysis_with_legs(24400, legs)
+        _, body, _ = notifier._format_signal(
+            _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
+            option_analysis=weekly,
+        )
+        assert "ITM CE 24350" in body
+        assert "ITM PE 24450" in body
+
+    def test_itm_lines_omitted_when_no_legs(self, notifier):
+        weekly = _dummy_expiry_analysis("10-Jul-2026", atm_ce_ltp=142.0, atm_pe_ltp=110.0)
+        _, body, _ = notifier._format_signal(
+            _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
+            option_analysis=weekly,
+        )
+        assert "ITM" not in body
+
+    def test_itm_lines_shown_for_both_weekly_and_monthly(self, notifier):
+        weekly_legs = [
+            _leg(24350, ce_ltp=178.0, pe_ltp=55.0),
+            _leg(24400, ce_ltp=142.0, pe_ltp=75.0, is_atm=True),
+            _leg(24450, ce_ltp=110.0, pe_ltp=95.0),
+        ]
+        monthly_legs = [
+            _leg(24350, ce_ltp=410.0, pe_ltp=180.0),
+            _leg(24400, ce_ltp=351.0, pe_ltp=210.0, is_atm=True),
+            _leg(24450, ce_ltp=300.0, pe_ltp=250.0),
+        ]
+        weekly = _expiry_analysis_with_legs(24400, weekly_legs)
+        monthly = _expiry_analysis_with_legs(24400, monthly_legs)
+        monthly.expiry = "28-Jul-2026"
+        _, body, _ = notifier._format_signal(
+            _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
+            option_analysis=weekly, monthly_option_analysis=monthly,
+        )
+        assert body.count("ITM CE 24350") == 2
+        assert body.count("ITM PE 24450") == 2
 
 
 class TestPushoverNotifierMultiSignal:

@@ -13,7 +13,40 @@ import requests
 
 from nifty_ai_agent.risk.calculator import RiskParameters
 from nifty_ai_agent.strategies.base import Signal, SignalType
-from nifty_ai_agent.strategies.option_analyser import ExpiryAnalysis
+from nifty_ai_agent.strategies.option_analyser import ExpiryAnalysis, OptionLeg
+
+
+def _format_price(ltp: float) -> str:
+    """Format a premium as '@ ₹X' ('@ ₹X.XX' below ₹10 to avoid a misleading
+    '@ ₹0' on near-expiry paise-level prices), or '@ market price' if unknown."""
+    if not ltp:
+        return "@ market price"
+    if ltp < 10:
+        return f"@ ₹{ltp:.2f}"
+    return f"@ ₹{ltp:.0f}"
+
+
+def _find_itm_legs(analysis: ExpiryAnalysis) -> tuple[OptionLeg | None, OptionLeg | None]:
+    """Return (itm_call_leg, itm_put_leg) — one strike deeper in-the-money than
+    the ATM strike already shown in the main contract line.
+
+    Anchored on the ATM *strike* (not spot) so these are always distinct from
+    the ATM line above them — if anchored on spot instead, the ATM strike
+    itself is sometimes already slightly ITM, making the "ITM" line a
+    redundant repeat of the ATM one.
+
+    ITM call = nearest strike below ATM. ITM put = nearest strike above ATM.
+    Returns (None, None) when there's no real strike data to draw from (e.g.
+    the VIX-based synthetic estimate has no strikes at all).
+    """
+    if not analysis.legs:
+        return None, None
+    atm = analysis.atm_strike
+    below = [leg for leg in analysis.legs if leg.strike < atm]
+    above = [leg for leg in analysis.legs if leg.strike > atm]
+    itm_call = max(below, key=lambda l: l.strike) if below else None
+    itm_put = min(above, key=lambda l: l.strike) if above else None
+    return itm_call, itm_put
 
 
 def _next_expiry(weekday: int) -> str:
@@ -150,36 +183,41 @@ class PushoverNotifier:
 
         Shows the weekly contract, and the monthly contract alongside it
         whenever a monthly option chain is available, so the two premiums
-        are never confused for one another.
+        are never confused for one another. Each also gets a follow-up line
+        with the nearest in-the-money call and put strikes, when real strike
+        data is available (not the VIX-based synthetic estimate).
         """
         if signal.signal == SignalType.HOLD:
             return []
 
         opt_type = "CE" if signal.signal == SignalType.BUY_CE else "PE"
 
-        def _line(analysis: ExpiryAnalysis, label: str) -> str:
+        def _lines_for(analysis: ExpiryAnalysis, label: str) -> list[str]:
             ltp = (
                 (analysis.atm_ce_ltp or analysis.theoretical_ce_atm)
                 if signal.signal == SignalType.BUY_CE
                 else (analysis.atm_pe_ltp or analysis.theoretical_pe_atm)
             )
-            if not ltp:
-                price_str = "@ market price"
-            elif ltp < 10:
-                # Near-expiry weekly premiums often decay to paise (e.g. ₹0.10) —
-                # rounding to whole rupees would misleadingly show "@ ₹0".
-                price_str = f"@ ₹{ltp:.2f}"
-            else:
-                price_str = f"@ ₹{ltp:.0f}"
             tag = label if analysis.is_live else f"{label}, Est."
-            return (
+            result = [
                 f"📌 Buy ({tag}): {index_name} {analysis.atm_strike} {opt_type}  "
-                f"{analysis.expiry}  {price_str}"
-            )
+                f"{analysis.expiry}  {_format_price(ltp)}"
+            ]
+
+            itm_call, itm_put = _find_itm_legs(analysis)
+            itm_parts = []
+            if itm_call and itm_call.ce_ltp:
+                itm_parts.append(f"ITM CE {itm_call.strike} {_format_price(itm_call.ce_ltp)}")
+            if itm_put and itm_put.pe_ltp:
+                itm_parts.append(f"ITM PE {itm_put.strike} {_format_price(itm_put.pe_ltp)}")
+            if itm_parts:
+                result.append("   " + "  |  ".join(itm_parts))
+
+            return result
 
         lines: list[str] = []
         if option_analysis:
-            lines.append(_line(option_analysis, "Weekly"))
+            lines.extend(_lines_for(option_analysis, "Weekly"))
         else:
             # Option chain unavailable — derive ATM from spot (entry price)
             strike = int(round(risk.entry_price / strike_step) * strike_step)
@@ -187,7 +225,7 @@ class PushoverNotifier:
             lines.append(f"📌 Buy (Weekly): {index_name} {strike} {opt_type}  {expiry}  @ market price")
 
         if monthly_option_analysis:
-            lines.append(_line(monthly_option_analysis, "Monthly"))
+            lines.extend(_lines_for(monthly_option_analysis, "Monthly"))
 
         return lines
 
