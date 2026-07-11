@@ -206,6 +206,54 @@ class TestPushoverNotifier:
         assert "Est." not in body
 
 
+class TestSellTargetInSignalNotification:
+    def _weekly_with_legs(self):
+        legs = [
+            _leg(23950, ce_ltp=178.0, pe_ltp=55.0),
+            _leg(24000, ce_ltp=142.0, pe_ltp=110.0, is_atm=True),
+            _leg(24050, ce_ltp=110.0, pe_ltp=140.0),
+        ]
+        return _expiry_analysis_with_legs(24000, legs)
+
+    def test_buy_ce_shows_sell_target_and_sl_exit(self, notifier):
+        _, body, _ = notifier._format_signal(
+            _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
+            option_analysis=self._weekly_with_legs(),
+        )
+        assert "SELL @ ₹" in body
+        assert "EXIT @ ₹" in body
+
+    def test_sell_target_above_entry_for_buy_ce(self, notifier):
+        # Risk target is above spot for CE, so the sell premium must exceed entry.
+        import re
+        _, body, _ = notifier._format_signal(
+            _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
+            option_analysis=self._weekly_with_legs(),
+        )
+        sell = float(re.search(r"SELL @ ₹([\d.]+) target", body).group(1))
+        exit_ = float(re.search(r"EXIT @ ₹([\d.]+) stop-loss", body).group(1))
+        assert sell > 142.0   # entry premium
+        assert exit_ < 142.0
+
+    def test_no_sell_line_when_risk_invalid(self, notifier):
+        _, body, _ = notifier._format_signal(
+            _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.HOLD), "",
+            option_analysis=self._weekly_with_legs(),
+        )
+        assert "SELL @" not in body
+
+    def test_sell_line_present_for_both_weekly_and_monthly(self, notifier):
+        weekly = self._weekly_with_legs()
+        monthly = self._weekly_with_legs()
+        monthly.expiry = "28-Jul-2026"
+        monthly.days_to_expiry = 17
+        _, body, _ = notifier._format_signal(
+            _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
+            option_analysis=weekly, monthly_option_analysis=monthly,
+        )
+        assert body.count("SELL @ ₹") == 2
+
+
 class TestFindItmLegs:
     def test_finds_strike_below_and_above_atm(self):
         legs = [

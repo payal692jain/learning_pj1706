@@ -20,6 +20,7 @@ from nifty_ai_agent.risk.calculator import RiskParameters
 from nifty_ai_agent.strategies.base import SignalType
 from nifty_ai_agent.strategies.option_analyser import (
     ExpiryAnalysis,
+    atm_iv,
     estimate_premium_at_spot,
 )
 
@@ -78,7 +79,7 @@ def build_trade_idea(
     if not entry or entry <= 0:
         return None
 
-    iv = _atm_iv(analysis, opt_type)
+    iv = atm_iv(analysis, opt_type)
     target_sell = estimate_premium_at_spot(
         entry, analysis.spot, risk.target, analysis.atm_strike,
         analysis.expiry, iv, opt_type,
@@ -101,24 +102,6 @@ def build_trade_idea(
         lot_size=lot_size,
         is_live=analysis.is_live,
     )
-
-
-def _atm_iv(analysis: ExpiryAnalysis, opt_type: str) -> float:
-    """Return the ATM leg's IV as a decimal for the given side.
-
-    Upstox occasionally reports junk IVs (0, or 500 on illiquid deep strikes),
-    so values outside a sane 1%–200% band fall back to the other side's IV,
-    then to 15%.
-    """
-    atm_leg = next((leg for leg in analysis.legs if leg.is_atm), None)
-    if atm_leg is None:
-        return 0.15
-    primary = (atm_leg.ce_iv if opt_type == "CE" else atm_leg.pe_iv) / 100
-    secondary = (atm_leg.pe_iv if opt_type == "CE" else atm_leg.ce_iv) / 100
-    for iv in (primary, secondary):
-        if 0.01 <= iv <= 2.0:
-            return iv
-    return 0.15
 
 
 def format_trade_plan(

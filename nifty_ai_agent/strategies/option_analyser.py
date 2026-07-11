@@ -463,6 +463,24 @@ def compute_atm_theoretical_prices(
     return round(ce, 1), round(pe, 1)
 
 
+def atm_iv(analysis: ExpiryAnalysis, opt_type: str) -> float:
+    """Return the ATM leg's IV as a decimal for the given side ("CE"/"PE").
+
+    Upstox occasionally reports junk IVs (0, or 500 on illiquid deep strikes),
+    so values outside a sane 1%–200% band fall back to the other side's IV,
+    then to 15%.
+    """
+    atm_leg = next((leg for leg in analysis.legs if leg.is_atm), None)
+    if atm_leg is None:
+        return 0.15
+    primary = (atm_leg.ce_iv if opt_type == "CE" else atm_leg.pe_iv) / 100
+    secondary = (atm_leg.pe_iv if opt_type == "CE" else atm_leg.ce_iv) / 100
+    for iv in (primary, secondary):
+        if 0.01 <= iv <= 2.0:
+            return iv
+    return 0.15
+
+
 def estimate_premium_at_spot(
     entry_premium: float,
     current_spot: float,

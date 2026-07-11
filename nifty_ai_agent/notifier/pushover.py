@@ -13,7 +13,12 @@ import requests
 
 from nifty_ai_agent.risk.calculator import RiskParameters
 from nifty_ai_agent.strategies.base import Signal, SignalType
-from nifty_ai_agent.strategies.option_analyser import ExpiryAnalysis, OptionLeg
+from nifty_ai_agent.strategies.option_analyser import (
+    ExpiryAnalysis,
+    OptionLeg,
+    atm_iv,
+    estimate_premium_at_spot,
+)
 
 
 def _format_price(ltp: float) -> str:
@@ -203,6 +208,23 @@ class PushoverNotifier:
                 f"📌 Buy ({tag}): {index_name} {analysis.atm_strike} {opt_type}  "
                 f"{analysis.expiry}  {_format_price(ltp)}"
             ]
+
+            # Estimated premiums to SELL at when the index reaches the risk
+            # target (and to EXIT at if it hits the stop-loss) — computed per
+            # expiry, since weekly and monthly premiums move differently.
+            if risk.is_valid and ltp and analysis.spot > 0:
+                iv = atm_iv(analysis, opt_type)
+                target_sell = estimate_premium_at_spot(
+                    ltp, analysis.spot, risk.target, analysis.atm_strike,
+                    analysis.expiry, iv, opt_type,
+                )
+                sl_sell = estimate_premium_at_spot(
+                    ltp, analysis.spot, risk.stop_loss, analysis.atm_strike,
+                    analysis.expiry, iv, opt_type,
+                )
+                result.append(
+                    f"   SELL @ ₹{target_sell:g} target  |  EXIT @ ₹{sl_sell:g} stop-loss"
+                )
 
             itm_call, itm_put = _find_itm_legs(analysis)
             itm_parts = []
