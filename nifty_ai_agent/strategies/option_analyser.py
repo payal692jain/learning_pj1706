@@ -463,6 +463,45 @@ def compute_atm_theoretical_prices(
     return round(ce, 1), round(pe, 1)
 
 
+def estimate_premium_at_spot(
+    entry_premium: float,
+    current_spot: float,
+    projected_spot: float,
+    strike: int,
+    expiry_str: str,
+    iv: float,
+    option_type: str,
+) -> float:
+    """Estimate what an option bought at *entry_premium* would trade at if the
+    index moved from *current_spot* to *projected_spot* (same day, same IV).
+
+    Applies the Black-Scholes price *change* on top of the live entry premium
+    rather than using the raw model price directly — this anchors the estimate
+    to the real market quote and cancels out any model-vs-market basis error.
+
+    Args:
+        entry_premium: Live premium the option was bought at.
+        current_spot: Index level at entry.
+        projected_spot: Index level to project to (e.g. the risk target or SL).
+        strike: Option strike price.
+        expiry_str: Expiry date string, e.g. '14-Jul-2026'.
+        iv: Annualised IV as a decimal (values outside 1%–200% fall back to 15%).
+        option_type: "CE" or "PE".
+
+    Returns:
+        Estimated premium, floored at 0.05 (an option can't trade below that tick).
+    """
+    dte = _days_to_expiry(expiry_str)
+    T = max(dte, 1) / 365
+    if not 0.01 <= iv <= 2.0:
+        iv = 0.15
+    base = _bs_price(current_spot, strike, T, _RISK_FREE_RATE, iv, option_type)
+    moved = _bs_price(projected_spot, strike, T, _RISK_FREE_RATE, iv, option_type)
+    # Round to the paise BEFORE flooring — the other way round, round(0.05, 1)
+    # silently turns the floor itself into 0.1.
+    return max(0.05, round(entry_premium + (moved - base), 2))
+
+
 def _stub_analysis(spot: float, expiry: str, strike_step: int = _STRIKE_STEP) -> ExpiryAnalysis:
     atm = _nearest_atm(spot, strike_step)
     return ExpiryAnalysis(

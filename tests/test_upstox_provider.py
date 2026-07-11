@@ -133,6 +133,32 @@ class TestGetOptionChain:
                 client.get_option_chain("NIFTY", "2026-07-09")
 
 
+class TestGetLotSize:
+    def test_reads_lot_size_from_contract_data(self, client):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {
+            "data": [{"expiry": "2026-07-28", "lot_size": 65}]
+        }
+        with patch("requests.get", return_value=mock_resp):
+            assert client.get_lot_size("NIFTY") == 65
+
+    def test_raises_when_no_lot_size_present(self, client):
+        mock_resp = MagicMock()
+        mock_resp.status_code = 200
+        mock_resp.raise_for_status.return_value = None
+        mock_resp.json.return_value = {"data": [{"expiry": "2026-07-28"}]}
+        with patch("requests.get", return_value=mock_resp):
+            with pytest.raises(RuntimeError):
+                client.get_lot_size("NIFTY")
+
+    def test_raises_without_token(self):
+        client = UpstoxClient(access_token="")
+        with pytest.raises(UpstoxAuthError):
+            client.get_lot_size("NIFTY")
+
+
 class TestGetQuote:
     def test_parses_price_and_ohlc(self, client):
         mock_resp = MagicMock()

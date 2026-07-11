@@ -36,6 +36,12 @@ from nifty_ai_agent.indicators.rsi import compute_rsi
 from nifty_ai_agent.indicators.vwap import compute_vwap
 from nifty_ai_agent.notifier.pushover import PushoverNotifier
 from nifty_ai_agent.reports.morning_report import run_morning_report
+from nifty_ai_agent.reports.trade_plan import (
+    FALLBACK_LOT_SIZES,
+    TradeIdea,
+    build_trade_idea,
+    format_trade_plan,
+)
 from nifty_ai_agent.risk.calculator import RiskCalculator, RiskParameters
 from nifty_ai_agent.strategies.base import BaseStrategy, Signal, SignalType
 from nifty_ai_agent.strategies.ema_crossover import EMACrossoverStrategy
@@ -501,6 +507,92 @@ def _run_eod_prediction() -> None:
     _run_all_pipelines(after_hours=True)
 
 
+# ── Trade plan (capital-aware, all indices in one message) ─────────────────────
+
+def _get_lot_size(index_name: str) -> int:
+    """Live lot size from Upstox contract data, falling back to known constants."""
+    token = get_settings().upstox_access_token
+    if token:
+        try:
+            from nifty_ai_agent.data.upstox_provider import UpstoxClient
+            return UpstoxClient(token).get_lot_size(index_name)
+        except Exception as exc:
+            logger.warning(
+                "Lot size fetch failed for %s (%s) — using fallback", index_name, exc,
+            )
+    return FALLBACK_LOT_SIZES.get(index_name, 50)
+
+
+def _build_index_trade_idea(index: IndexConfig, settings) -> TradeIdea | None:
+    """Compute the highest-confidence actionable trade for one index, or None (HOLD)."""
+    provider = index.make_provider()
+    spot = provider.get_spot_data()
+    hist = provider.get_historical_data(
+        days=settings.historical_days, interval=settings.data_interval,
+    )
+
+    df = compute_ema(hist, periods=[20, 50])
+    df = compute_rsi(df)
+    df = compute_macd(df)
+    df = compute_atr(df)
+    df = compute_vwap(df)
+    latest = df.dropna(subset=["ema_20", "ema_50", "rsi", "atr"]).iloc[-1]
+
+    rsi_analysis = analyse_rsi(df)
+    oc_weekly, _ = _get_cached_option_analysis(index, provider, spot.price)
+    breadth = BreadthSnapshot(0, 0, 0, 0, 0.0, "NEUTRAL", [], [])
+
+    signals = [
+        _generate_and_adjust_signal(s, df, rsi_analysis, oc_weekly, None, breadth, index.name)
+        for s in _STRATEGIES
+    ]
+    actionable = [s for s in signals if s.signal != SignalType.HOLD]
+    if not actionable or oc_weekly is None:
+        return None
+    best = max(actionable, key=lambda s: s.confidence)
+
+    risk = RiskCalculator(
+        max_risk_pct=settings.max_risk_per_trade_pct,
+        daily_loss_limit_pct=settings.daily_loss_limit_pct,
+        min_rr=settings.min_risk_reward_ratio,
+    ).calculate(best.signal, spot.price, float(latest["atr"]))
+
+    return build_trade_idea(
+        index.name, best.signal, best.confidence, oc_weekly, risk,
+        _get_lot_size(index.name),
+    )
+
+
+def _run_trade_plan() -> None:
+    """Send one capital-aware trade-plan notification covering all three indices."""
+    if not _is_market_hours():
+        logger.info("Trade plan: outside market hours — skipping.")
+        return
+
+    settings = get_settings()
+    ideas: list[TradeIdea] = []
+    holds: list[str] = []
+    for index in _INDEX_CONFIGS:
+        try:
+            idea = _build_index_trade_idea(index, settings)
+        except Exception as exc:
+            logger.error("Trade plan: %s failed: %s", index.name, exc)
+            idea = None
+        (ideas.append(idea) if idea else holds.append(index.name))
+
+    title, body = format_trade_plan(
+        ideas, holds, settings.trading_capital, settings.daily_profit_target,
+    )
+    try:
+        PushoverNotifier(
+            user_key=settings.pushover_user_key,
+            api_token=settings.pushover_api_token,
+        ).send_text(title=title, message=body)
+        logger.info("Trade plan sent (%d ideas, %d holds)", len(ideas), len(holds))
+    except Exception as exc:
+        logger.error("Trade plan Pushover failed: %s", exc)
+
+
 # ── Entry point ────────────────────────────────────────────────────────────────
 
 _ES_CONTINUOUS      = 0x80000000
@@ -594,6 +686,7 @@ def main() -> None:
     # ── Schedule ────────────────────────────────────────────────────────────────
     schedule.every().day.at("08:00").do(_run_morning_report)
     schedule.every(settings.data_fetch_interval_minutes).minutes.do(_run_all_pipelines)
+    schedule.every(30).minutes.do(_run_trade_plan)  # capital-aware plan, all 3 indices
     schedule.every().day.at("16:00").do(_run_eod_prediction)
 
     # ── Immediate startup action ─────────────────────────────────────────────

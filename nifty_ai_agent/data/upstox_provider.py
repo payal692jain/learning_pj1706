@@ -95,6 +95,27 @@ class UpstoxClient:
         })
         return drop_expiring_today(expiries)
 
+    def get_lot_size(self, index_name: str) -> int:
+        """Return the option contract lot size for *index_name* from live contract data.
+
+        Lot sizes are revised by SEBI/exchanges periodically, so reading them from
+        the live contract feed beats hardcoding.
+        """
+        instrument_key = self._require_instrument_key(index_name)
+
+        resp = requests.get(
+            f"{_UPSTOX_BASE}/option/contract",
+            params={"instrument_key": instrument_key},
+            headers=self._headers(),
+            timeout=_TIMEOUT,
+        )
+        self._raise_for_auth_error(resp)
+        resp.raise_for_status()
+        for item in resp.json().get("data", []):
+            if item.get("lot_size"):
+                return int(item["lot_size"])
+        raise RuntimeError(f"No lot_size in Upstox contract data for {index_name}")
+
     def get_option_chain(self, index_name: str, expiry_date: str) -> pd.DataFrame:
         """Return a strikes DataFrame for *index_name* at *expiry_date* ('YYYY-MM-DD').
 

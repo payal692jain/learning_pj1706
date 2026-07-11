@@ -50,6 +50,14 @@ class Settings(BaseSettings):
         description="yfinance bar interval: 5m for live intraday, 1d for EOD/backtesting",
     )
 
+    # ── Trade plan (capital-aware sizing in the plan notification) ──
+    trading_capital: float = Field(
+        default=50000.0, description="Deployable capital in INR for the trade-plan notification"
+    )
+    daily_profit_target: float = Field(
+        default=10000.0, description="Daily profit goal in INR shown in the trade-plan notification"
+    )
+
     # ── Risk ───────────────────────────────────────────────────
     max_risk_per_trade_pct: float = Field(
         default=1.0, description="Maximum risk per trade as % of capital"

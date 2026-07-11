@@ -11,6 +11,7 @@ from nifty_ai_agent.strategies.option_analyser import (
     _nearest_atm,
     _norm_cdf,
     analyse_option_chain,
+    estimate_premium_at_spot,
     format_analysis_for_notification,
     option_chain_confidence_adjustment,
 )
@@ -112,6 +113,40 @@ class TestDaysToExpiry:
 
     def test_invalid_format_returns_one(self):
         assert _days_to_expiry("invalid") == 1
+
+
+class TestEstimatePremiumAtSpot:
+    # A realistic near-term expiry, computed relative to today: with a very
+    # long expiry, rate discounting makes BS put values degenerate to ~0 and
+    # the tests stop exercising the real behaviour.
+    from datetime import date as _date, timedelta as _timedelta
+    _EXPIRY = (_date.today() + _timedelta(days=5)).strftime("%d-%b-%Y")
+
+    def test_ce_gains_when_index_rises(self):
+        up = estimate_premium_at_spot(100.0, 24200.0, 24350.0, 24200, self._EXPIRY, 0.12, "CE")
+        assert up > 100.0
+
+    def test_ce_loses_when_index_falls(self):
+        down = estimate_premium_at_spot(100.0, 24200.0, 24050.0, 24200, self._EXPIRY, 0.12, "CE")
+        assert down < 100.0
+
+    def test_pe_gains_when_index_falls(self):
+        up = estimate_premium_at_spot(95.0, 24200.0, 24050.0, 24200, self._EXPIRY, 0.12, "PE")
+        assert up > 95.0
+
+    def test_floors_at_tick_minimum(self):
+        # A huge adverse move can't take the premium below the 0.05 tick.
+        crashed = estimate_premium_at_spot(5.0, 24200.0, 22000.0, 24200, self._EXPIRY, 0.12, "CE")
+        assert crashed == 0.05
+
+    def test_junk_iv_falls_back_sanely(self):
+        # IV of 5.0 (500%) is out of band → falls back to 15% and still prices.
+        result = estimate_premium_at_spot(100.0, 24200.0, 24350.0, 24200, self._EXPIRY, 5.0, "CE")
+        assert result > 100.0
+
+    def test_unchanged_spot_returns_entry(self):
+        same = estimate_premium_at_spot(100.0, 24200.0, 24200.0, 24200, self._EXPIRY, 0.12, "CE")
+        assert same == pytest.approx(100.0, abs=0.11)
 
 
 class TestAnalyseOptionChain:
