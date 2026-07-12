@@ -78,7 +78,7 @@ class TestFormatTradePlan:
     def test_reachable_target_flagged_with_check(self):
         # +₹5,200/lot at target, 7 lots affordable → ₹10k needs 2 lots → reachable
         _, body = format_trade_plan([_idea()], [], 50000, 10000)
-        assert "✓ ₹10,000 target needs 2 lot(s)" in body
+        assert "✓ NIFTY: ₹10,000 needs 2 lot(s)" in body
 
     def test_unreachable_target_flagged_honestly(self):
         # Tiny move: +₹5/lot at target → needs 2000 lots — flag NOT reachable.
@@ -89,7 +89,7 @@ class TestFormatTradePlan:
     def test_unaffordable_lot_flagged(self):
         idea = _idea(entry=1000.0, lot=65)  # 1 lot = ₹65,000 > ₹50,000
         _, body = format_trade_plan([idea], [], 50000, 10000)
-        assert "more than your ₹50,000 capital" in body
+        assert "1 lot ₹65,000 > capital ₹50,000" in body
 
     def test_holds_listed(self):
         title, body = format_trade_plan([], ["NIFTY", "SENSEX"], 50000, 10000)
@@ -99,8 +99,10 @@ class TestFormatTradePlan:
 
     def test_sell_and_exit_prices_shown(self):
         _, body = format_trade_plan([_idea()], [], 50000, 10000)
-        assert "SELL @ ₹180 target" in body
-        assert "EXIT @ ₹60 stop-loss" in body
+        sell_row = next(l for l in body.splitlines() if l.startswith("Sell ₹"))
+        exit_row = next(l for l in body.splitlines() if l.startswith("Exit ₹"))
+        assert "180" in sell_row
+        assert "60" in exit_row
 
     def test_disclaimer_always_present(self):
         _, body = format_trade_plan([], ["NIFTY"], 50000, 10000)

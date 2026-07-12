@@ -104,77 +104,111 @@ def build_trade_idea(
     )
 
 
+def _short_name(name: str) -> str:
+    """Fit an index name into a narrow table column header."""
+    return {"BANKNIFTY": "BANKNIF"}.get(name, name)[:7]
+
+
+def _inr(value: float) -> str:
+    """Compact INR for a table cell: 6760 → '6.8k', 102193 → '102k'."""
+    if abs(value) >= 100_000:
+        return f"{value / 1000:,.0f}k"
+    if abs(value) >= 1_000:
+        return f"{value / 1000:.1f}k"
+    return f"{value:,.0f}"
+
+
+def _prem(value: float) -> str:
+    """Premium for a table cell — whole rupees, but two decimals below ₹10 so
+    near-expiry paise premiums don't collapse to a misleading '0'."""
+    if value and value < 10:
+        return f"{value:.2f}"
+    return f"{value:,.0f}"
+
+
 def format_trade_plan(
     ideas: list[TradeIdea],
     holds: list[str],
     capital: float,
     profit_target: float,
 ) -> tuple[str, str]:
-    """Return (title, body) for the combined three-index trade-plan notification."""
+    """Return (title, body) for the combined three-index trade-plan notification.
+
+    Rendered in Pushover monospace mode as a column-per-index table so all
+    three indices line up and read at a glance.
+    """
     summary = " | ".join(
         [f"{i.index_name} {i.opt_type}" for i in ideas] + [f"{h} —" for h in holds]
     )
     title = f"🎯 Trade Plan — {summary}" if summary else "🎯 Trade Plan"
 
     lines: list[str] = [
-        f"Capital ₹{capital:,.0f} · Daily target ₹{profit_target:,.0f}",
+        f"Capital ₹{capital:,.0f} · Target ₹{profit_target:,.0f}/day",
         "",
     ]
 
-    for idea in ideas:
-        lines.extend(_format_idea(idea, capital, profit_target))
+    if ideas:
+        def row(label: str, cells: list[str]) -> str:
+            return f"{label:<8}" + "".join(f"{c:>9}" for c in cells)
+
+        aff = [
+            int(capital // i.cost_per_lot) if i.cost_per_lot > 0 else 0 for i in ideas
+        ]
+        lines += [
+            row("", [_short_name(i.index_name) + ("*" if not i.is_live else "") for i in ideas]),
+            row("Option", [f"{i.strike}{i.opt_type}" for i in ideas]),
+            row("Expiry", [i.expiry[:6] for i in ideas]),
+            row("Buy ₹", [_prem(i.entry_premium) for i in ideas]),
+            row("Sell ₹", [_prem(i.target_sell) for i in ideas]),
+            row("Exit ₹", [_prem(i.sl_sell) for i in ideas]),
+            row("Lot qty", [str(i.lot_size) for i in ideas]),
+            row("1lot ₹", [_inr(i.cost_per_lot) for i in ideas]),
+            row("Lots/cap", [str(a) for a in aff]),
+            row("P/L tgt", [
+                f"+{_inr(i.pnl_target_per_lot * a)}" if a else "0"
+                for i, a in zip(ideas, aff)
+            ]),
+            row("P/L SL", [
+                f"-{_inr(abs(i.pnl_sl_per_lot) * a)}" if a else "0"
+                for i, a in zip(ideas, aff)
+            ]),
+            "",
+        ]
+
+        # Per-index reachability of the daily target — the honest part.
+        for idea, a in zip(ideas, aff):
+            lines.append(_reachability_note(idea, a, capital, profit_target))
         lines.append("")
 
     for name in holds:
-        lines.append(f"⏸ {name}: HOLD — no edge right now, staying out IS the plan.")
+        lines.append(f"⏸ {name}: HOLD — no edge; staying out IS the plan.")
     if holds:
         lines.append("")
 
+    if ideas:
+        lines.append("(Sell=at target, Exit=at stop-loss; P/L for max lots)")
+    pct = profit_target / capital * 100 if capital else 0
     lines.append(
-        "⚠️ Sell prices are model estimates at the risk target/SL — signals, "
-        "not guarantees. A ₹{:,.0f}/day goal on ₹{:,.0f} is {:.0f}%/day; expect "
-        "losing days and never risk money you can't afford to lose.".format(
-            profit_target, capital, profit_target / capital * 100 if capital else 0,
-        )
+        f"⚠️ Estimates, not guarantees. ₹{profit_target:,.0f}/day on "
+        f"₹{capital:,.0f} is {pct:.0f}%/day — expect losing days; never risk "
+        "money you can't afford to lose."
     )
     return title, "\n".join(lines)
 
 
-def _format_idea(idea: TradeIdea, capital: float, profit_target: float) -> list[str]:
-    icon = "📈" if idea.opt_type == "CE" else "📉"
-    est = "" if idea.is_live else " (Est.)"
-    lines = [
-        f"{icon} {idea.index_name}: BUY {idea.strike} {idea.opt_type}  {idea.expiry}"
-        f"  @ ₹{idea.entry_premium:g}{est}  ({idea.confidence}%)",
-        f"   SELL @ ₹{idea.target_sell:g} target  |  EXIT @ ₹{idea.sl_sell:g} stop-loss",
-        f"   1 lot = {idea.lot_size} qty = ₹{idea.cost_per_lot:,.0f}"
-        f"  →  +₹{idea.pnl_target_per_lot:,.0f} at target / −₹{abs(idea.pnl_sl_per_lot):,.0f} at SL",
-    ]
-
-    affordable = int(capital // idea.cost_per_lot) if idea.cost_per_lot > 0 else 0
+def _reachability_note(idea: TradeIdea, affordable: int, capital: float, profit_target: float) -> str:
+    est = "*" if not idea.is_live else ""
     if affordable == 0:
-        lines.append(
-            f"   ✗ 1 lot costs ₹{idea.cost_per_lot:,.0f} — more than your ₹{capital:,.0f} capital."
+        return f"✗ {idea.index_name}{est}: 1 lot ₹{idea.cost_per_lot:,.0f} > capital ₹{capital:,.0f}"
+    if idea.pnl_target_per_lot <= 0:
+        return f"• {idea.index_name}{est}: no upside at target — skip"
+    needed = math.ceil(profit_target / idea.pnl_target_per_lot)
+    if needed <= affordable:
+        return (
+            f"✓ {idea.index_name}{est}: ₹{profit_target:,.0f} needs {needed} lot(s)"
+            f" (₹{idea.cost_per_lot * needed:,.0f})"
         )
-        return lines
-
-    lines.append(
-        f"   Max {affordable} lot(s) with capital → "
-        f"+₹{idea.pnl_target_per_lot * affordable:,.0f} at target / "
-        f"−₹{abs(idea.pnl_sl_per_lot) * affordable:,.0f} at SL"
+    return (
+        f"✗ {idea.index_name}{est}: ₹{profit_target:,.0f} needs {needed} lot(s) —"
+        f" NOT reachable; max ₹{idea.pnl_target_per_lot * affordable:,.0f}"
     )
-
-    if idea.pnl_target_per_lot > 0:
-        needed = math.ceil(profit_target / idea.pnl_target_per_lot)
-        if needed <= affordable:
-            lines.append(
-                f"   ✓ ₹{profit_target:,.0f} target needs {needed} lot(s)"
-                f" (₹{idea.cost_per_lot * needed:,.0f})"
-            )
-        else:
-            lines.append(
-                f"   ✗ ₹{profit_target:,.0f} target needs {needed} lot(s)"
-                f" (₹{idea.cost_per_lot * needed:,.0f}) — NOT reachable with"
-                f" ₹{capital:,.0f}; max realistic: ₹{idea.pnl_target_per_lot * affordable:,.0f}"
-            )
-    return lines

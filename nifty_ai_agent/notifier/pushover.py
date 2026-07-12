@@ -21,14 +21,22 @@ from nifty_ai_agent.strategies.option_analyser import (
 )
 
 
-def _format_price(ltp: float) -> str:
-    """Format a premium as '@ ₹X' ('@ ₹X.XX' below ₹10 to avoid a misleading
-    '@ ₹0' on near-expiry paise-level prices), or '@ market price' if unknown."""
-    if not ltp:
-        return "@ market price"
-    if ltp < 10:
-        return f"@ ₹{ltp:.2f}"
-    return f"@ ₹{ltp:.0f}"
+def _fmt_cell(value: float) -> str:
+    """Format a premium for a table cell.
+
+    Two decimals below ₹10 so near-expiry paise premiums (e.g. 0.10) don't
+    round to a misleading "0"; 'mkt' when the premium is unknown.
+    """
+    if not value:
+        return "mkt"
+    if value < 10:
+        return f"{value:.2f}"
+    return f"{value:,.0f}"
+
+
+def _short_expiry(expiry: str) -> str:
+    """'14-Jul-2026' → '14-Jul' — the year wastes table width."""
+    return expiry[:6] if len(expiry) >= 6 else expiry
 
 
 def _find_itm_legs(analysis: ExpiryAnalysis) -> tuple[OptionLeg | None, OptionLeg | None]:
@@ -105,7 +113,9 @@ class PushoverNotifier:
         # EOD predictions and BUY/PE signals play sound.
         # Intraday HOLD is shown silently (lock-screen banner, no noise).
         sound = "none" if (not prediction and signal.signal == SignalType.HOLD) else ""
-        return self._send(title=title, message=body, priority=priority, sound=sound)
+        return self._send(
+            title=title, message=body, priority=priority, sound=sound, monospace=True,
+        )
 
     def send_multi_signal(
         self,
@@ -128,11 +138,16 @@ class PushoverNotifier:
         )
         any_actionable = any(signal.signal != SignalType.HOLD for signal, _, _ in results)
         sound = "none" if (not prediction and not any_actionable) else ""
-        return self._send(title=title, message=body, priority=priority, sound=sound)
+        return self._send(
+            title=title, message=body, priority=priority, sound=sound, monospace=True,
+        )
 
-    def send_text(self, title: str, message: str, priority: int = _PRIORITY_NORMAL) -> bool:
+    def send_text(
+        self, title: str, message: str, priority: int = _PRIORITY_NORMAL,
+        monospace: bool = False,
+    ) -> bool:
         """Send a raw push notification."""
-        return self._send(title=title, message=message, priority=priority)
+        return self._send(title=title, message=message, priority=priority, monospace=monospace)
 
     def _send(
         self,
@@ -140,6 +155,7 @@ class PushoverNotifier:
         message: str,
         priority: int = _PRIORITY_NORMAL,
         sound: str = "",
+        monospace: bool = False,
     ) -> bool:
         payload: dict = {
             "token": self._api_token,
@@ -150,6 +166,9 @@ class PushoverNotifier:
         }
         if sound:
             payload["sound"] = sound
+        if monospace:
+            # Fixed-width rendering so the contract tables stay aligned.
+            payload["monospace"] = 1
         # High-priority messages require retry/expire params
         if priority == _PRIORITY_HIGH:
             payload["retry"] = 60
@@ -175,7 +194,7 @@ class PushoverNotifier:
         return False
 
     @staticmethod
-    def _format_contract_lines(
+    def _format_contract_table(
         signal: Signal,
         risk: RiskParameters,
         option_analysis: ExpiryAnalysis | None,
@@ -184,70 +203,87 @@ class PushoverNotifier:
         strike_step: int,
         expiry_weekday: int,
     ) -> list[str]:
-        """Return the '📌 Buy' line(s) for a BUY_CE/BUY_PE signal.
+        """Return an aligned Weekly/Monthly table for a BUY_CE/BUY_PE signal.
 
-        Shows the weekly contract, and the monthly contract alongside it
-        whenever a monthly option chain is available, so the two premiums
-        are never confused for one another. Each also gets a follow-up line
-        with the nearest in-the-money call and put strikes, when real strike
-        data is available (not the VIX-based synthetic estimate).
+        Rendered in Pushover's monospace mode, so column alignment holds:
+
+            📌 BUY NIFTY 24200 CE
+                       Weekly    Monthly
+            Expiry     14-Jul     28-Jul
+            Buy ₹         104        269
+            Sell ₹        329        459   ← at index target
+            Exit ₹         46        195   ← at stop-loss
+            ITM CE  24150@135  24150@292
+            ITM PE  24250@111  24250@235
         """
         if signal.signal == SignalType.HOLD:
             return []
 
         opt_type = "CE" if signal.signal == SignalType.BUY_CE else "PE"
 
-        def _lines_for(analysis: ExpiryAnalysis, label: str) -> list[str]:
-            ltp = (
-                (analysis.atm_ce_ltp or analysis.theoretical_ce_atm)
-                if signal.signal == SignalType.BUY_CE
-                else (analysis.atm_pe_ltp or analysis.theoretical_pe_atm)
-            )
-            tag = label if analysis.is_live else f"{label}, Est."
-            result = [
-                f"📌 Buy ({tag}): {index_name} {analysis.atm_strike} {opt_type}  "
-                f"{analysis.expiry}  {_format_price(ltp)}"
-            ]
-
-            # Estimated premiums to SELL at when the index reaches the risk
-            # target (and to EXIT at if it hits the stop-loss) — computed per
-            # expiry, since weekly and monthly premiums move differently.
-            if risk.is_valid and ltp and analysis.spot > 0:
-                iv = atm_iv(analysis, opt_type)
-                target_sell = estimate_premium_at_spot(
-                    ltp, analysis.spot, risk.target, analysis.atm_strike,
-                    analysis.expiry, iv, opt_type,
-                )
-                sl_sell = estimate_premium_at_spot(
-                    ltp, analysis.spot, risk.stop_loss, analysis.atm_strike,
-                    analysis.expiry, iv, opt_type,
-                )
-                result.append(
-                    f"   SELL @ ₹{target_sell:g} target  |  EXIT @ ₹{sl_sell:g} stop-loss"
-                )
-
-            itm_call, itm_put = _find_itm_legs(analysis)
-            itm_parts = []
-            if itm_call and itm_call.ce_ltp:
-                itm_parts.append(f"ITM CE {itm_call.strike} {_format_price(itm_call.ce_ltp)}")
-            if itm_put and itm_put.pe_ltp:
-                itm_parts.append(f"ITM PE {itm_put.strike} {_format_price(itm_put.pe_ltp)}")
-            if itm_parts:
-                result.append("   " + "  |  ".join(itm_parts))
-
-            return result
-
-        lines: list[str] = []
+        cols: list[tuple[str, ExpiryAnalysis]] = []
         if option_analysis:
-            lines.extend(_lines_for(option_analysis, "Weekly"))
-        else:
+            cols.append(("Weekly", option_analysis))
+        if monthly_option_analysis:
+            cols.append(("Monthly", monthly_option_analysis))
+        if not cols:
             # Option chain unavailable — derive ATM from spot (entry price)
             strike = int(round(risk.entry_price / strike_step) * strike_step)
             expiry = _next_expiry(expiry_weekday)
-            lines.append(f"📌 Buy (Weekly): {index_name} {strike} {opt_type}  {expiry}  @ market price")
+            return [f"📌 Buy: {index_name} {strike} {opt_type}  {expiry}  @ market price"]
 
-        if monthly_option_analysis:
-            lines.extend(_lines_for(monthly_option_analysis, "Monthly"))
+        def row(label: str, cells: list[str]) -> str:
+            return f"{label:<7}" + "".join(f"{c:>11}" for c in cells)
+
+        entries = [
+            (a.atm_ce_ltp or a.theoretical_ce_atm) if opt_type == "CE"
+            else (a.atm_pe_ltp or a.theoretical_pe_atm)
+            for _, a in cols
+        ]
+
+        lines = [
+            f"📌 BUY {index_name} {cols[0][1].atm_strike} {opt_type}",
+            row("", [label + ("*" if not a.is_live else "") for label, a in cols]),
+            row("Expiry", [_short_expiry(a.expiry) for _, a in cols]),
+            row("Buy ₹", [_fmt_cell(e) for e in entries]),
+        ]
+
+        # Premium to SELL at when the index reaches the risk target, and to
+        # EXIT at if it hits the stop-loss — per expiry, since weekly and
+        # monthly premiums move differently for the same index move.
+        if risk.is_valid:
+            sells, exits = [], []
+            for (_, a), entry in zip(cols, entries):
+                if entry and a.spot > 0:
+                    iv = atm_iv(a, opt_type)
+                    sells.append(_fmt_cell(estimate_premium_at_spot(
+                        entry, a.spot, risk.target, a.atm_strike, a.expiry, iv, opt_type,
+                    )))
+                    exits.append(_fmt_cell(estimate_premium_at_spot(
+                        entry, a.spot, risk.stop_loss, a.atm_strike, a.expiry, iv, opt_type,
+                    )))
+                else:
+                    sells.append("-")
+                    exits.append("-")
+            lines.append(row("Sell ₹", sells))
+            lines.append(row("Exit ₹", exits))
+
+        itm_ce_cells, itm_pe_cells = [], []
+        for _, a in cols:
+            itm_call, itm_put = _find_itm_legs(a)
+            itm_ce_cells.append(
+                f"{itm_call.strike}@{itm_call.ce_ltp:.0f}" if itm_call and itm_call.ce_ltp else "-"
+            )
+            itm_pe_cells.append(
+                f"{itm_put.strike}@{itm_put.pe_ltp:.0f}" if itm_put and itm_put.pe_ltp else "-"
+            )
+        if any(c != "-" for c in itm_ce_cells + itm_pe_cells):
+            lines.append(row("ITM CE", itm_ce_cells))
+            lines.append(row("ITM PE", itm_pe_cells))
+
+        lines.append("(Sell=at target, Exit=at stop-loss)")
+        if any(not a.is_live for _, a in cols):
+            lines.append("* estimated — no live chain")
 
         return lines
 
@@ -281,22 +317,20 @@ class PushoverNotifier:
             lines.append("⚠️ Market closed — based on last session's closing data.")
             lines.append("Outlook for next trading session:\n")
 
-        # ── Suggested contract(s) — weekly + monthly (always shown for BUY signals) ──
+        # ── Suggested contract table — weekly + monthly (BUY signals only) ──────
         if signal.signal != SignalType.HOLD:
-            lines.extend(PushoverNotifier._format_contract_lines(
+            lines.extend(PushoverNotifier._format_contract_table(
                 signal, risk, option_analysis, monthly_option_analysis,
                 index_name, strike_step, expiry_weekday,
             ))
             lines.append("")
 
-        # ── Risk parameters ────────────────────────────────────────────────────
+        # ── Risk parameters (index levels) ──────────────────────────────────────
         lines.append(f"Strategy: {signal.strategy}")
         if risk.is_valid:
             lines += [
-                f"Entry:  {risk.entry_price:,.0f}",
-                f"SL:     {risk.stop_loss:,.0f}",
-                f"Target: {risk.target:,.0f}",
-                f"RR:     1:{risk.risk_reward_ratio}",
+                f"Entry:  {risk.entry_price:>9,.0f}   SL: {risk.stop_loss:>9,.0f}",
+                f"Target: {risk.target:>9,.0f}   RR: {'1:' + str(risk.risk_reward_ratio):>9}",
             ]
         else:
             lines.append(f"[No trade — {risk.rejection_reason or 'HOLD'}]")
@@ -346,7 +380,7 @@ class PushoverNotifier:
             icon = icons.get(signal.signal, "")
             lines.append(f"{icon} {signal.strategy} — {signal.signal.value} ({signal.confidence}%)")
 
-            lines.extend(PushoverNotifier._format_contract_lines(
+            lines.extend(PushoverNotifier._format_contract_table(
                 signal, risk, option_analysis, monthly_option_analysis,
                 index_name, strike_step, expiry_weekday,
             ))

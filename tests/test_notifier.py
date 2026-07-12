@@ -156,15 +156,19 @@ class TestPushoverNotifier:
         )
         assert "SL:" not in body
 
-    def test_weekly_and_monthly_contract_both_shown(self, notifier):
+    def test_weekly_and_monthly_columns_both_shown(self, notifier):
         weekly = _dummy_expiry_analysis("10-Jul-2026", atm_ce_ltp=142.0, atm_pe_ltp=110.0)
         monthly = _dummy_expiry_analysis("31-Jul-2026", atm_ce_ltp=310.0, atm_pe_ltp=280.0)
         _, body, _ = notifier._format_signal(
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly, monthly_option_analysis=monthly,
         )
-        assert "Buy (Weekly): NIFTY 24000 CE  10-Jul-2026  @ ₹142" in body
-        assert "Buy (Monthly): NIFTY 24000 CE  31-Jul-2026  @ ₹310" in body
+        assert "📌 BUY NIFTY 24000 CE" in body
+        assert "Weekly" in body and "Monthly" in body
+        assert "10-Jul" in body and "31-Jul" in body
+        # Buy row carries both premiums in one aligned line
+        buy_row = next(l for l in body.splitlines() if l.startswith("Buy ₹"))
+        assert "142" in buy_row and "310" in buy_row
 
     def test_only_weekly_shown_when_monthly_unavailable(self, notifier):
         weekly = _dummy_expiry_analysis("10-Jul-2026", atm_ce_ltp=142.0, atm_pe_ltp=110.0)
@@ -172,8 +176,8 @@ class TestPushoverNotifier:
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly, monthly_option_analysis=None,
         )
-        assert "Buy (Weekly)" in body
-        assert "Buy (Monthly)" not in body
+        assert "Weekly" in body
+        assert "Monthly" not in body
 
     def test_synthetic_prices_labelled_estimate(self, notifier):
         weekly = _dummy_expiry_analysis("10-Jul-2026", atm_ce_ltp=96.0, atm_pe_ltp=75.0, is_live=False)
@@ -182,19 +186,20 @@ class TestPushoverNotifier:
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly, monthly_option_analysis=monthly,
         )
-        assert "Buy (Weekly, Est.)" in body
-        assert "Buy (Monthly, Est.)" in body
+        assert "Weekly*" in body
+        assert "Monthly*" in body
+        assert "* estimated" in body
 
     def test_sub_rupee_premium_shows_decimals_not_zero(self, notifier):
         # Near-expiry weekly premiums can decay to paise (e.g. 0.10) — must not
-        # round to a misleading "@ ₹0".
+        # round to a misleading "0".
         weekly = _dummy_expiry_analysis("07-Jul-2026", atm_ce_ltp=0.10, atm_pe_ltp=1.2)
         _, body, _ = notifier._format_signal(
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly,
         )
-        assert "@ ₹0.10" in body
-        assert "@ ₹0 " not in body and not body.rstrip().endswith("@ ₹0")
+        buy_row = next(l for l in body.splitlines() if l.startswith("Buy ₹"))
+        assert "0.10" in buy_row
 
     def test_live_prices_not_labelled_estimate(self, notifier):
         weekly = _dummy_expiry_analysis("10-Jul-2026", atm_ce_ltp=142.0, atm_pe_ltp=110.0, is_live=True)
@@ -202,8 +207,9 @@ class TestPushoverNotifier:
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly,
         )
-        assert "Buy (Weekly):" in body
-        assert "Est." not in body
+        assert "Weekly" in body
+        assert "Weekly*" not in body
+        assert "* estimated" not in body
 
 
 class TestSellTargetInSignalNotification:
@@ -215,34 +221,38 @@ class TestSellTargetInSignalNotification:
         ]
         return _expiry_analysis_with_legs(24000, legs)
 
-    def test_buy_ce_shows_sell_target_and_sl_exit(self, notifier):
+    @staticmethod
+    def _row_values(body: str, label: str) -> list[float]:
+        import re
+        row = next(l for l in body.splitlines() if l.startswith(label))
+        return [float(v.replace(",", "")) for v in re.findall(r"[\d,]+\.?\d*", row)]
+
+    def test_buy_ce_shows_sell_target_and_sl_exit_rows(self, notifier):
         _, body, _ = notifier._format_signal(
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=self._weekly_with_legs(),
         )
-        assert "SELL @ ₹" in body
-        assert "EXIT @ ₹" in body
+        assert "Sell ₹" in body
+        assert "Exit ₹" in body
+        assert "(Sell=at target, Exit=at stop-loss)" in body
 
     def test_sell_target_above_entry_for_buy_ce(self, notifier):
         # Risk target is above spot for CE, so the sell premium must exceed entry.
-        import re
         _, body, _ = notifier._format_signal(
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=self._weekly_with_legs(),
         )
-        sell = float(re.search(r"SELL @ ₹([\d.]+) target", body).group(1))
-        exit_ = float(re.search(r"EXIT @ ₹([\d.]+) stop-loss", body).group(1))
-        assert sell > 142.0   # entry premium
-        assert exit_ < 142.0
+        assert self._row_values(body, "Sell ₹")[0] > 142.0   # entry premium
+        assert self._row_values(body, "Exit ₹")[0] < 142.0
 
-    def test_no_sell_line_when_risk_invalid(self, notifier):
+    def test_no_sell_row_when_risk_invalid(self, notifier):
         _, body, _ = notifier._format_signal(
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.HOLD), "",
             option_analysis=self._weekly_with_legs(),
         )
-        assert "SELL @" not in body
+        assert "Sell ₹" not in body
 
-    def test_sell_line_present_for_both_weekly_and_monthly(self, notifier):
+    def test_sell_row_carries_weekly_and_monthly_cells(self, notifier):
         weekly = self._weekly_with_legs()
         monthly = self._weekly_with_legs()
         monthly.expiry = "28-Jul-2026"
@@ -251,7 +261,8 @@ class TestSellTargetInSignalNotification:
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly, monthly_option_analysis=monthly,
         )
-        assert body.count("SELL @ ₹") == 2
+        assert len(self._row_values(body, "Sell ₹")) == 2
+        assert len(self._row_values(body, "Exit ₹")) == 2
 
 
 class TestFindItmLegs:
@@ -310,8 +321,8 @@ class TestItmLinesInNotification:
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly,
         )
-        assert "ITM CE 24350" in body
-        assert "ITM PE 24450" in body
+        assert "ITM CE" in body and "24350@178" in body
+        assert "ITM PE" in body and "24450@95" in body
 
     def test_itm_lines_omitted_when_no_legs(self, notifier):
         weekly = _dummy_expiry_analysis("10-Jul-2026", atm_ce_ltp=142.0, atm_pe_ltp=110.0)
@@ -339,8 +350,11 @@ class TestItmLinesInNotification:
             _dummy_signal(SignalType.BUY_CE), _dummy_risk(SignalType.BUY_CE), "",
             option_analysis=weekly, monthly_option_analysis=monthly,
         )
-        assert body.count("ITM CE 24350") == 2
-        assert body.count("ITM PE 24450") == 2
+        # One ITM CE row with a cell per expiry: weekly 24350@178, monthly 24350@410
+        itm_ce_row = next(l for l in body.splitlines() if l.startswith("ITM CE"))
+        assert "24350@178" in itm_ce_row and "24350@410" in itm_ce_row
+        itm_pe_row = next(l for l in body.splitlines() if l.startswith("ITM PE"))
+        assert "24450@95" in itm_pe_row and "24450@250" in itm_pe_row
 
 
 class TestPushoverNotifierMultiSignal:
@@ -384,8 +398,10 @@ class TestPushoverNotifierMultiSignal:
         _, body, _ = notifier._format_multi_signal(
             self._results(), option_analysis=weekly, monthly_option_analysis=monthly,
         )
-        assert "Buy (Weekly): NIFTY 24000 CE  10-Jul-2026  @ ₹142" in body
-        assert "Buy (Monthly): NIFTY 24000 CE  31-Jul-2026  @ ₹310" in body
+        assert "📌 BUY NIFTY 24000 CE" in body
+        assert "10-Jul" in body and "31-Jul" in body
+        buy_row = next(l for l in body.splitlines() if l.startswith("Buy ₹"))
+        assert "142" in buy_row and "310" in buy_row
 
     def test_send_multi_signal_silent_when_all_hold(self, notifier):
         hold_signal = Signal(

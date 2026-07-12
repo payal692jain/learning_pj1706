@@ -587,7 +587,7 @@ def _run_trade_plan() -> None:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
-        ).send_text(title=title, message=body)
+        ).send_text(title=title, message=body, monospace=True)
         logger.info("Trade plan sent (%d ideas, %d holds)", len(ideas), len(holds))
     except Exception as exc:
         logger.error("Trade plan Pushover failed: %s", exc)
