@@ -78,54 +78,24 @@ def fetch_global_indices() -> list[IndexSnapshot]:
 
 
 def fetch_gift_nifty() -> GiftNiftySnapshot | None:
-    """Fetch GIFT Nifty pre-market data from NSE IFSC API."""
-    import requests
+    """Fetch GIFT Nifty from the live NSE IX feed.
 
-    url = "https://www.nseindia.com/api/liveanalysis-giftnifty"
-    try:
-        session = requests.Session()
-        session.headers.update(_NSE_HEADERS)
-        session.get("https://www.nseindia.com", timeout=8)
-        resp = session.get(url, timeout=10)
-        resp.raise_for_status()
-        data = resp.json()
+    Delegates to data/gift_nifty.py. The two sources this used to try are both dead:
+    NSE's `/api/liveanalysis-giftnifty` now 404s, and yfinance's ^NSEIFSC is delisted
+    — so this function had been returning None on every single call, which meant GIFT
+    silently never reached the morning report OR the intraday confidence adjuster.
+    """
+    from nifty_ai_agent.data.gift_nifty import fetch_gift_nifty as _fetch
 
-        # NSE IFSC response structure varies — handle gracefully
-        records = data.get("data", [])
-        if not records:
-            raise ValueError("Empty GIFT Nifty data")
-
-        # The first record is usually the active front-month contract
-        rec = records[0]
-        price = float(rec.get("lastPrice", 0) or rec.get("ltp", 0))
-        change = float(rec.get("change", 0) or rec.get("netChange", 0))
-        prev = price - change if price else 0
-        change_pct = (change / prev * 100) if prev else 0.0
-
-        return GiftNiftySnapshot(
-            price=round(price, 2),
-            change=round(change, 2),
-            change_pct=round(change_pct, 2),
-        )
-    except Exception as exc:
-        logger.warning("GIFT Nifty fetch failed: %s — trying yfinance fallback", exc)
-        return _gift_nifty_yfinance_fallback()
-
-
-def _gift_nifty_yfinance_fallback() -> GiftNiftySnapshot | None:
-    """Try yfinance as fallback for GIFT Nifty (SGX Nifty was ^CNXIT, now limited)."""
-    try:
-        # NIFTY futures on NSE IFSC; yfinance sometimes has this
-        ticker = yf.Ticker("^NSEIFSC")
-        info = ticker.fast_info
-        price = float(info.last_price)
-        prev = float(info.previous_close)
-        change = price - prev
-        change_pct = (change / prev * 100) if prev else 0.0
-        return GiftNiftySnapshot(price=price, change=round(change, 2), change_pct=round(change_pct, 2))
-    except Exception as exc:
-        logger.warning("GIFT Nifty yfinance fallback also failed: %s", exc)
+    quote = _fetch()
+    if quote is None:
         return None
+    return GiftNiftySnapshot(
+        price=round(quote.price, 2),
+        change=round(quote.change, 2),
+        change_pct=round(quote.change_pct, 2),
+        source="NSE IX",
+    )
 
 
 def compute_global_bias(indices: list[IndexSnapshot]) -> str:

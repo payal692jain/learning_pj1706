@@ -77,6 +77,15 @@ class Settings(BaseSettings):
         description="Stop-loss distance as a multiple of ATR — shared by the risk and margin engines",
     )
 
+    # ── Next-session outlook (GIFT Nifty) ──────────────────────
+    gap_history_days: int = Field(
+        default=400,
+        description=(
+            "Calendar days of NIFTY daily bars used to compute gap base rates "
+            "(~275 trading sessions — enough to fill the rarer large-gap buckets)"
+        ),
+    )
+
     # ── Margin ─────────────────────────────────────────────────
     max_margin_utilisation_pct: float = Field(
         default=100.0,

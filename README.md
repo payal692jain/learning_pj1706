@@ -274,6 +274,32 @@ Same shape as `NSEDataProvider`, but there's no scrape-based middle tier — BSE
 reliable public option chain API to fall back on, so it's Upstox or straight to the
 VIX-based synthetic estimate.
 
+#### `gift_nifty.py` — GIFT Nifty & the Next-Session Outlook
+
+GIFT Nifty (NSE International Exchange) is a NIFTY future trading ~21h/day in two sessions:
+
+| Session | Hours (IST) | What it tells you |
+|---|---|---|
+| Session 1 | 06:30 – 15:40 | Final pre-open read, 2h45m before the 09:15 cash open |
+| Session 2 | 16:35 – 02:45 | Overnight read — prices in Wall Street's whole day while NSE is shut |
+
+The outlook is pushed at **17:00** (Session 2 open) and **06:45** (Session 1 open).
+
+**Implied open is computed from GIFT's % move, not its level.** GIFT is a *future*, so it carries a basis (carry premium) over NIFTY spot. Differencing its level against NIFTY's close — "GIFT at 24,250 vs a 24,200 close means a 50-point gap up" — books that carry premium as a phantom gap-up *every single day*. The percentage move is basis-neutral.
+
+**Every forecast ships with its base rate** (`strategies/gap_analyser.py`), computed from ~275 sessions of NIFTY daily bars. This matters because the naive instinct is frequently the losing one:
+
+| Gap bucket | Sample | Continued | Avg close-vs-open |
+|---|---|---|---|
+| **LARGE_UP** (≥0.75%) | 14 | **36%** | **−0.27%** |
+| SMALL_UP | 81 | 48% | −0.05% |
+| SMALL_DOWN | 59 | 51% | −0.02% |
+| **LARGE_DOWN** (≤−0.75%) | 15 | **40%** | **+0.20%** |
+
+Big gap-ups have *faded* and big gap-downs have *bounced* — a large gap up often opens at the day's high as overnight holders sell into the people chasing the open. Continuation is measured from the **open** (where a gap trader actually gets filled), not from the prior close.
+
+> **Note:** this replaced a data source that was silently dead. NSE's `/api/liveanalysis-giftnifty` now 404s and yfinance's `^NSEIFSC` is delisted, so the old `fetch_gift_nifty()` returned `None` on **every** call — GIFT never reached the morning report or the confidence adjuster at all.
+
 #### `market_context.py` — Global Indices + GIFT Nifty
 8 global indices via yfinance + GIFT Nifty from NSE IFSC API. Computes weighted `global_bias`.
 
@@ -793,6 +819,8 @@ market_analysyis/
 ### Phase 2 — Enhanced Analysis
 - ✅ **Bank Nifty support** — BANKNIFTY chain with strike step 100, plus CE/PE suggestions on the individual constituent banks that confirm the index move *(done)*
 - ✅ **Global cues in intraday signals** — global index bias, GIFT Nifty, India VIX regime, and RSS headline sentiment now adjust intraday confidence, not just the 08:00 report *(done)*
+- ✅ **GIFT Nifty next-session outlook** — live NSE IX feed drives an implied-open forecast at 17:00 (Session 2 open) and 06:45 (Session 1 open), each paired with the historical base rate for that gap size *(done)*
+- **Gap-aware opening strategy** — let the 09:15 open consume the gap base rate directly (e.g. suppress BUY_CE on a large gap-up, which has historically faded) rather than only reporting it
 - **Option Greeks** (Delta, Theta, Gamma, Vega) derived from chain IV — show P/L sensitivity for each signal
 - **OI change tracking** — compare current OI to previous fetch to detect fresh accumulation vs unwinding
 - **PCR trend** — 5-session PCR moving average to identify momentum in put/call writing

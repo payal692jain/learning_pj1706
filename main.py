@@ -1,8 +1,14 @@
 """NIFTY AI Agent — main entry point.
 
-Two scheduled jobs:
-  1. 08:00 AM IST daily  — pre-market morning report (global cues, option chain, news)
-  2. Every 5 min         — intraday signal pipeline (during market hours)
+Scheduled jobs (all IST):
+  06:45        — next-session outlook (GIFT Nifty Session 1 has opened; final pre-open read)
+  08:00        — pre-market morning report (global cues, option chain, news)
+  08:05, hourly — Upstox token health check
+  every 5 min  — intraday signal pipeline → one consensus trade call per index
+  every 15 min — risk & margin report (sent whatever the signals say)
+  every 30 min — capital-aware trade plan across all three indices
+  16:00        — EOD prediction for the next session
+  17:00        — next-session outlook (GIFT Nifty Session 2 has opened; first overnight read)
 
 Start:
     python main.py
@@ -26,6 +32,7 @@ from nifty_ai_agent.ai.explainer import SignalExplainer
 from nifty_ai_agent.config import configure_logging, get_settings
 from nifty_ai_agent.data.bank_options import BankOptionIdea, suggest_bank_options
 from nifty_ai_agent.data.banknifty_breadth import fetch_banknifty_breadth
+from nifty_ai_agent.data.gift_nifty import build_outlook, fetch_gift_nifty
 from nifty_ai_agent.data.token_health import TokenMonitor
 from nifty_ai_agent.data.breadth import BreadthSnapshot, fetch_realtime_breadth
 from nifty_ai_agent.data.bse_provider import BSEDataProvider
@@ -46,6 +53,7 @@ from nifty_ai_agent.reports.margin_report import (
     format_margin_report,
 )
 from nifty_ai_agent.reports.morning_report import run_morning_report
+from nifty_ai_agent.reports.next_session import format_next_session
 from nifty_ai_agent.reports.trade_call import format_trade_call
 from nifty_ai_agent.reports.trade_plan import (
     FALLBACK_LOT_SIZES,
@@ -58,6 +66,7 @@ from nifty_ai_agent.risk.margin import MarginCalculator
 from nifty_ai_agent.strategies.base import BaseStrategy, Signal, SignalType
 from nifty_ai_agent.strategies.bollinger_squeeze import BollingerSqueezeStrategy
 from nifty_ai_agent.strategies.consensus import Consensus, build_consensus
+from nifty_ai_agent.strategies.gap_analyser import analyse_gap_history, compute_pivots
 from nifty_ai_agent.strategies.global_analyser import (
     GlobalSnapshot,
     fetch_global_snapshot,
@@ -571,6 +580,55 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         logger.error("%s Pushover failed: %s", index.name, exc)
 
 
+# ── Next-session outlook (GIFT Nifty) ─────────────────────────────────────────
+
+def _run_next_session_outlook() -> None:
+    """Send the GIFT Nifty read on where NIFTY opens next session.
+
+    Scheduled for the two moments GIFT actually says something new: 17:00 (Session 2
+    has opened at 16:35, pricing tomorrow overnight) and 06:45 (Session 1 has opened
+    at 06:30 — the final pre-open read, with Wall Street's full day now in the price).
+    """
+    settings = get_settings()
+
+    gift = fetch_gift_nifty()
+    if gift is None:
+        logger.warning("Next-session outlook: GIFT Nifty unavailable — skipping.")
+        return
+
+    try:
+        daily = NSEDataProvider(
+            symbol=settings.nifty_symbol,
+            upstox_access_token=settings.upstox_access_token,
+        ).get_historical_data(days=settings.gap_history_days, interval="1d")
+    except Exception as exc:
+        logger.error("Next-session outlook: NIFTY daily history failed: %s", exc)
+        return
+
+    clean = daily.dropna(subset=["open", "high", "low", "close"])
+    if clean.empty:
+        logger.error("Next-session outlook: no usable daily bars.")
+        return
+
+    last = clean.iloc[-1]
+    outlook = build_outlook(gift, float(last["close"]))
+    stats = analyse_gap_history(clean, outlook.bucket)
+    pivots = compute_pivots(float(last["high"]), float(last["low"]), float(last["close"]))
+
+    title, body = format_next_session(outlook, stats, pivots)
+    try:
+        PushoverNotifier(
+            user_key=settings.pushover_user_key,
+            api_token=settings.pushover_api_token,
+        ).send_text(title=title, message=body, monospace=True)
+        logger.info(
+            "Next-session outlook sent: %s %+.0f pts (%s, n=%d)",
+            outlook.direction, outlook.gap_points, outlook.bucket, stats.sample,
+        )
+    except Exception as exc:
+        logger.error("Next-session outlook Pushover failed: %s", exc)
+
+
 # The monitor is stateful — it alerts on token state CHANGES, not on every cycle,
 # so a dead token produces one notification per day rather than one every 5 minutes.
 _token_monitor: TokenMonitor | None = None
@@ -867,6 +925,10 @@ def main() -> None:
         logger.warning("Startup ping failed: %s", exc)
 
     # ── Schedule ────────────────────────────────────────────────────────────────
+    # GIFT Nifty reads on the next session: 17:00 (Session 2 open, first overnight
+    # read) and 06:45 (Session 1 open, final pre-open read before 09:15).
+    schedule.every().day.at("06:45").do(_run_next_session_outlook)
+    schedule.every().day.at("17:00").do(_run_next_session_outlook)
     schedule.every().day.at("08:00").do(_run_morning_report)
     # Token health runs before the market opens (so a dead overnight token is caught
     # while there is still time to fix it) and hourly through the session.
