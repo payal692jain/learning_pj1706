@@ -121,13 +121,23 @@ class TestPushoverNotifier:
         _, _, priority = notifier._format_signal(_dummy_signal(SignalType.BUY_CE), _dummy_risk(), "")
         assert priority == _PRIORITY_NORMAL
 
-    def test_hold_low_priority(self, notifier):
+    def test_hold_is_normal_priority_but_silent(self, notifier):
+        """HOLD still earns a lock-screen banner, so it keeps normal priority — it is
+        silenced through the `sound` payload instead, not by demoting the priority
+        (Pushover's low priority suppresses the banner as well as the sound)."""
         _, _, priority = notifier._format_signal(
             _dummy_signal(SignalType.HOLD),
             _dummy_risk(SignalType.HOLD),
             "",
         )
-        assert priority == _PRIORITY_LOW
+        assert priority == _PRIORITY_NORMAL
+
+        with patch.object(notifier, "_send", return_value=True) as send:
+            notifier.send_signal(
+                _dummy_signal(SignalType.HOLD), _dummy_risk(SignalType.HOLD), "",
+            )
+        assert send.call_args.kwargs["sound"] == "none"
+        assert send.call_args.kwargs["priority"] == _PRIORITY_NORMAL
 
     def test_buy_pe_message_contains_signal(self, notifier):
         title, body, _ = notifier._format_signal(

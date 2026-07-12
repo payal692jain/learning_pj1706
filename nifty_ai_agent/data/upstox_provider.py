@@ -1,8 +1,10 @@
 """Upstox v2 API client — live option chain, quotes, and historical candles.
 
 Unlike NSE's website, Upstox's API is an authenticated REST API — no bot
-detection to route around. It requires an access token that expires nightly
-(~3:30 AM IST); see scripts/upstox_login.py for the daily refresh flow.
+detection to route around. It needs an access token in UPSTOX_ACCESS_TOKEN.
+Recommended: an Analytics Access Token (read-only, market-data only, valid
+~1 year) so no refresh is needed. Alternatively, scripts/upstox_login.py
+provides a daily-expiring token via the OAuth login flow.
 """
 
 import logging
@@ -192,6 +194,40 @@ class UpstoxClient:
             "volume": float(quote_data.get("volume") or 0),
         }
 
+    def get_ltp(self, instrument_keys: list[str]) -> dict[str, float]:
+        """Last traded price for arbitrary instrument keys, keyed BY THE KEY passed in.
+
+        Unlike get_quote(), this takes raw keys, so it works for stock options and
+        anything else not in the index lookup table. Upstox echoes results under its
+        own "EXCHANGE:Symbol" naming rather than the key we sent, so the response is
+        re-keyed here against each row's instrument_token — callers should not have to
+        know about that quirk.
+        """
+        if not instrument_keys:
+            return {}
+        if not self._access_token:
+            raise UpstoxAuthError("UPSTOX_ACCESS_TOKEN is not set")
+
+        resp = requests.get(
+            f"{_UPSTOX_BASE}/market-quote/ltp",
+            params={"instrument_key": ",".join(instrument_keys)},
+            headers=self._headers(),
+            timeout=_TIMEOUT,
+        )
+        self._raise_for_auth_error(resp)
+        resp.raise_for_status()
+
+        prices: dict[str, float] = {}
+        for row in (resp.json().get("data") or {}).values():
+            key = row.get("instrument_token")
+            if key:
+                prices[key] = float(row.get("last_price", 0.0) or 0.0)
+
+        missing = set(instrument_keys) - set(prices)
+        if missing:
+            logger.debug("Upstox LTP: no price for %d key(s)", len(missing))
+        return prices
+
     # ── Historical OHLCV (for indicators) ───────────────────────────────
 
     def get_historical_ohlcv(self, index_name: str, days: int, interval: str = "5m") -> pd.DataFrame:
@@ -270,6 +306,7 @@ class UpstoxClient:
     def _raise_for_auth_error(resp: requests.Response) -> None:
         if resp.status_code in (401, 403):
             raise UpstoxAuthError(
-                f"Upstox rejected the access token (HTTP {resp.status_code}) — "
-                "it has likely expired; re-run scripts/upstox_login.py"
+                f"Upstox rejected the access token (HTTP {resp.status_code}) — it "
+                "may be expired or invalid; regenerate the Analytics token (or "
+                "re-run scripts/upstox_login.py if using daily tokens)"
             )

@@ -13,3 +13,6 @@ build/
 .venv/
 .idea/
 .claude/settings.local.json
+
+# Upstox instrument master — refetched daily, ~40MB expanded; never commit
+nifty_ai_agent/cache/

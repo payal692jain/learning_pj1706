@@ -32,7 +32,11 @@ class Settings(BaseSettings):
     upstox_api_secret: str = Field(default="", description="Upstox developer app API secret")
     upstox_redirect_uri: str = Field(default="", description="Upstox OAuth redirect URI")
     upstox_access_token: str = Field(
-        default="", description="Upstox access token — refreshed daily via scripts/upstox_login.py"
+        default="",
+        description=(
+            "Upstox access token — a long-lived (~1yr) Analytics Access Token, "
+            "or a daily token from scripts/upstox_login.py"
+        ),
     )
 
     # ── Market data ────────────────────────────────────────────
@@ -68,6 +72,20 @@ class Settings(BaseSettings):
     min_risk_reward_ratio: float = Field(
         default=2.0, description="Minimum acceptable RR ratio"
     )
+    atr_sl_multiplier: float = Field(
+        default=1.5,
+        description="Stop-loss distance as a multiple of ATR — shared by the risk and margin engines",
+    )
+
+    # ── Margin ─────────────────────────────────────────────────
+    max_margin_utilisation_pct: float = Field(
+        default=100.0,
+        description="Share of capital that may be committed as margin (below 100 keeps a buffer)",
+    )
+    margin_report_interval_minutes: int = Field(
+        default=15,
+        description="How often the standalone risk & margin notification is sent",
+    )
 
     # ── Logging ────────────────────────────────────────────────
     log_level: str = Field(default="INFO", description="Python logging level")
@@ -77,10 +95,10 @@ class Settings(BaseSettings):
 def get_settings() -> Settings:
     """Re-read `.env` on every call.
 
-    Intentionally not cached: UPSTOX_ACCESS_TOKEN is refreshed daily by
-    scripts/upstox_login.py while the agent keeps running for days at a
-    time — a cached Settings object would freeze that token (and any other
-    .env edit) at whatever it was when the process started.
+    Intentionally not cached: UPSTOX_ACCESS_TOKEN may be updated (e.g. a daily
+    scripts/upstox_login.py refresh, or swapping in a new Analytics token)
+    while the agent keeps running for days at a time — a cached Settings object
+    would freeze that token (and any other .env edit) at process-start value.
     """
     return Settings()
 

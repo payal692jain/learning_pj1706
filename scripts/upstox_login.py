@@ -1,8 +1,10 @@
-"""One-time-per-day helper: obtain a fresh Upstox access token and write it to .env.
+"""Fallback helper: obtain a daily-expiring Upstox access token and write it to .env.
 
-Upstox's v2 API tokens expire nightly (~3:30 AM IST) — there is no long-lived
-refresh token, so this needs to run once each morning before the agent needs
-live option chain data.
+You usually DON'T need this. The simplest setup is to paste an Analytics
+Access Token (read-only, market-data only, valid ~1 year) into
+UPSTOX_ACCESS_TOKEN once — see README setup. Use this script only if you'd
+rather use OAuth login tokens, which expire nightly (~3:30 AM IST) and so must
+be refreshed each morning before the agent needs live data.
 
 Usage:
     python scripts/upstox_login.py

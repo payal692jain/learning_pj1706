@@ -254,7 +254,7 @@ no bot detection to work around.
 - **`get_expiries(index_name)`** — fetches available expiry dates from `/v2/option/contract`. Instrument keys: `NSE_INDEX|Nifty 50` (NIFTY), `BSE_INDEX|SENSEX` (SENSEX).
 - **`get_option_chain(index_name, expiry_date)`** — fetches strike-level OI/LTP/IV from `/v2/option/chain`, normalised into the same `strike/ce_oi/pe_oi/ce_ltp/pe_ltp/ce_iv/pe_iv` shape the rest of the pipeline expects.
 - **`drop_expiring_today()`** — an option expiring within hours has no meaningful time left to trade, so any expiry dated today is dropped before picking "weekly" — it always rolls forward to the next available expiry.
-- Access tokens expire nightly (~3:30 AM IST) — see [`scripts/upstox_login.py`](#setup--installation) for the daily refresh flow.
+- Auth uses a read-only access token in `UPSTOX_ACCESS_TOKEN`. Simplest is an **Analytics Access Token** (market-data only, valid ~1 year, no refresh); alternatively [`scripts/upstox_login.py`](#setup--installation) writes a daily-expiring OAuth token. See [Setup](#setup--installation).
 
 #### `nse_provider.py` — NSEDataProvider (NIFTY)
 - **`get_spot_data()`** — yfinance `fast_info.last_price` for live price
@@ -531,7 +531,7 @@ Reason: EMA20 (24,120) > EMA50 (24,050) with RSI at 67.1. RSI OVERBOUGHT
 - Git
 - Pushover account (pushover.net — $5 one-time licence after 30-day trial)
 - Anthropic API key (console.anthropic.com — optional)
-- Upstox trading account + developer app (upstox.com — free; optional but strongly recommended for live option prices instead of the synthetic estimate)
+- Upstox account + developer app (upstox.com — free; optional but strongly recommended for live option prices instead of the synthetic estimate). Generate an **Analytics Access Token** (read-only, valid ~1 year) so you never need a daily login.
 
 ### Step 1 — Install
 ```bash
@@ -554,25 +554,33 @@ PUSHOVER_API_TOKEN=your_app_token      # create an app at pushover.net
 # Optional — enables AI explanations and daily plan
 ANTHROPIC_API_KEY=sk-ant-...           # from console.anthropic.com
 
-# Optional — enables live weekly + monthly option chain prices for NIFTY + SENSEX.
-# Without these, the agent falls back to an NSE scrape and finally a VIX-based
+# Optional — enables live weekly + monthly option chain prices for all indices.
+# Without a token, the agent falls back to an NSE scrape and finally a VIX-based
 # estimate (clearly labelled "(Est.)" in notifications).
+#
+# EASIEST: generate an Analytics Access Token (your app → Generate Token) and
+# paste it here. Read-only, market-data only, valid ~1 year — no daily refresh,
+# and the KEY/SECRET/REDIRECT_URI below can stay blank.
+UPSTOX_ACCESS_TOKEN=your_analytics_token
+#
+# Only needed for the daily-login alternative (Step 3):
 UPSTOX_API_KEY=your_api_key            # from account.upstox.com/developer/apps
 UPSTOX_API_SECRET=your_api_secret
 UPSTOX_REDIRECT_URI=https://www.google.com/upstox-callback  # must be https://, not localhost
-UPSTOX_ACCESS_TOKEN=                   # filled in daily — see Step 3
 
 # Market data defaults (fine as-is)
 NIFTY_SYMBOL=^NSEI
 SENSEX_SYMBOL=^BSESN
+BANKNIFTY_SYMBOL=^NSEBANK
 DATA_FETCH_INTERVAL_MINUTES=5
 DATA_INTERVAL=5m
 HISTORICAL_DAYS=10
 ```
 
-### Step 3 — Refresh the Upstox token (skip if not using Upstox)
-Upstox access tokens expire nightly (~3:30 AM IST) — there's no long-lived refresh
-token, so this runs once each morning before market open:
+### Step 3 — Daily token refresh (ONLY if not using an Analytics token)
+If you pasted an Analytics Access Token in Step 2, **skip this** — it's valid for
+~1 year. Otherwise, OAuth login tokens expire nightly (~3:30 AM IST), so run this
+once each morning before market open:
 ```bash
 python scripts/upstox_login.py
 # Opens the Upstox login page — log in, then paste back the redirected URL.
@@ -607,7 +615,8 @@ python main.py
 ### Daily workflow
 ```
 07:55 AM  →  Ensure python main.py is running
-             (If using Upstox: run scripts/upstox_login.py first — token expired overnight)
+             (Only if using daily OAuth tokens: run scripts/upstox_login.py first.
+              With an Analytics token, nothing to do — it's valid ~1 year.)
 08:00 AM  →  Pushover messages arrive (NIFTY):
               ① Global bias + GIFT Nifty level
               ② NIFTY 50 advance/decline + top movers
@@ -708,7 +717,7 @@ market_analysyis/
 ├── .gitignore
 │
 ├── scripts/
-│   └── upstox_login.py                  # Daily Upstox access-token refresh helper
+│   └── upstox_login.py                  # Optional daily OAuth token helper (not needed with an Analytics token)
 │
 ├── nifty_ai_agent/
 │   ├── config.py                        # Pydantic settings (incl. Upstox)
@@ -782,17 +791,21 @@ market_analysyis/
 ## Future Improvements
 
 ### Phase 2 — Enhanced Analysis
+- ✅ **Bank Nifty support** — BANKNIFTY chain with strike step 100, plus CE/PE suggestions on the individual constituent banks that confirm the index move *(done)*
+- ✅ **Global cues in intraday signals** — global index bias, GIFT Nifty, India VIX regime, and RSS headline sentiment now adjust intraday confidence, not just the 08:00 report *(done)*
 - **Option Greeks** (Delta, Theta, Gamma, Vega) derived from chain IV — show P/L sensitivity for each signal
 - **OI change tracking** — compare current OI to previous fetch to detect fresh accumulation vs unwinding
-- **Bank Nifty support** — separate weekly expiry chain for BANKNIFTY with adjusted strike step (100)
 - **PCR trend** — 5-session PCR moving average to identify momentum in put/call writing
 
 ### Phase 3 — Multi-Strategy Engine
-- ✅ **Two independent strategies** — EMA Crossover + VWAP Breakout, both run every cycle, saved and notified separately *(done)*
-- **Strategy ranking** — score all strategies; only alert (or boost confidence) when ≥ 2 agree
+- ✅ **Six independent strategies** — EMA Crossover, VWAP Breakout, Supertrend, MACD Momentum, Opening Range Breakout, Bollinger Squeeze *(done)*
+- ✅ **Strategy ranking / consensus** — every strategy is weighted (by intraday suitability and time of day) and folded into ONE verdict; a split book returns NO_TRADE rather than picking the marginally louder half *(done)*
+- ✅ **Real-time margin engine** — SPAN + exposure estimates for futures and short options, premium debit for long options, with lot sizing against capital, the 1% risk rule, and the daily loss budget *(done)*
 - **Volume-Price Analysis strategy** — implement Coulling's effort-vs-result as a standalone signal module
 - **Chart pattern detection** — programmatically detect Bulkowski patterns (flags, triangles, double bottoms)
 - **Multi-timeframe confirmation** — require 15-min and 5-min agreement before firing
+- **Broker-live margin** — replace the local SPAN estimate with Upstox `POST /v2/charges/margin` (needs a trading-scoped token; the read-only Analytics token is rejected)
+- **Regime-adaptive weights** — learn strategy weights from realised outcomes instead of the hand-set table in `consensus.py`
 
 ### Phase 4 — Learning
 - **Signal outcome tracking** — log result (win/loss/partial) against each signal record
@@ -808,9 +821,13 @@ market_analysyis/
 - **Paper trading tracker** — log your manual trades against signals; calculate real P/L and win rate
 
 ### Phase 6 — Broker Integration
-- ✅ **Upstox API** — live option contract prices (weekly + monthly) for the specific CE/PE to trade, for both NIFTY and SENSEX *(done)*
+- ✅ **Upstox API** — live option contract prices (weekly + monthly) for the specific CE/PE to trade, across NIFTY, SENSEX, and BANKNIFTY *(done)*
+- ✅ **No daily token hassle** — a read-only Analytics Access Token (valid ~1 year) removes the daily login; `scripts/upstox_login.py` remains as an OAuth fallback *(done)*
+- ✅ **Token health monitor + auto-resume** — a dead token is detected, alerted once (not once per cycle), and live data resumes automatically the moment a fresh token is written to `.env` — no restart *(done)*
+- ✅ **Instrument master** — Upstox's public NSE contract feed is cached daily to resolve stock option contracts by symbol, instead of hardcoding ISINs *(done)*
 - **Order preview** — generate the exact order parameters but require manual confirmation to place
-- **Automated daily token refresh** — currently a manual `scripts/upstox_login.py` run each morning; could be scripted around market-open time
+
+> **On fully automatic token renewal:** it is not possible, and the code does not pretend otherwise. Upstox's OAuth `authorization_code` grant requires a human at a browser and issues no refresh token, so a daily token cannot be renewed unattended. The agent instead detects expiry, tells you once, keeps running on estimated premiums, and picks the new token up automatically when it appears. The real fix is the ~1-year Analytics Access Token — which is why the alert names it.
 
 ---
 
@@ -819,8 +836,7 @@ market_analysyis/
 - `.venv/` and `.idea/` are gitignored too — keep local environments and IDE config out of version control
 - Logs never record API key values — only key presence
 - Pushover and Upstox credentials only read at runtime via `get_settings()`
-- **Upstox access tokens expire nightly** (~3:30 AM IST) — a leaked token has a short shelf life, but treat `.env` as sensitive regardless
-- ⚠️ This repository currently tracks `nifty_ai_agent.db` (SQLite) in git — if the repo is public, anyone can see your accumulated signal history. Add `*.db` back to `.gitignore` and `git rm --cached nifty_ai_agent.db` if you'd rather keep that private.
+- **The Upstox token is read-only** — the recommended Analytics token (and the OAuth login tokens) grant market-data access only; neither can place, modify, or cancel orders even if leaked. Treat `.env` as sensitive regardless (the Analytics token is valid ~1 year).
 
 ---
 
