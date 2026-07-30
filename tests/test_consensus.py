@@ -9,7 +9,7 @@ from nifty_ai_agent.strategies.consensus import build_consensus, effective_weigh
 
 _MORNING = dt_time(10, 0)
 _AFTERNOON = dt_time(14, 0)
-_LATE = dt_time(15, 10)
+_LATE = dt_time(15, 25)
 
 
 def _sig(strategy: str, signal: SignalType, confidence: int = 70) -> Signal:
@@ -84,7 +84,7 @@ class TestConsensus:
         assert "no setup" in c.rationale
 
     def test_no_new_entries_after_the_cutoff(self):
-        """A weekly option bought at 15:10 has one session of value left and an
+        """A weekly option bought at 15:25 has minutes of value left and an
         overnight gap to survive — the indicators do not get a vote on that."""
         signals = [_sig(s, SignalType.BUY_CE, 90) for s in
                    ("Opening_Range_Breakout", "VWAP_Breakout", "Supertrend")]

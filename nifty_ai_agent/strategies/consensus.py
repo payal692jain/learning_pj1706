@@ -12,9 +12,9 @@ Two intraday-specific rules that a naive vote count would miss:
    signal at 14:30 is describing a range that stopped mattering hours ago. Weights
    decay accordingly.
 
-2. **Late entries lose to theta.** A weekly option bought after 15:00 has one
-   session of value left and an overnight gap to survive. Past the cutoff the
-   engine returns NO_TRADE regardless of how bullish the indicators look.
+2. **Late entries lose to theta.** A weekly option bought after 15:20 has minutes
+   of session left and an overnight gap to survive. Past the cutoff the engine
+   returns NO_TRADE regardless of how bullish the indicators look.
 """
 
 import logging
@@ -44,7 +44,8 @@ _ORB_STALE_START = dt_time(13, 0)   # by the afternoon the range is history
 _ORB_STALE_MULTIPLIER = 0.4
 
 # No new intraday option entries after this — not enough session left to be paid.
-_ENTRY_CUTOFF = dt_time(15, 0)
+# 15:20 leaves the last 10 minutes to 15:30 close for exits only, not fresh entries.
+_ENTRY_CUTOFF = dt_time(15, 20)
 
 # Share of the DIRECTIONAL vote the winner must carry. Measured against bullish +
 # bearish weight only, never against the whole book: with two possible directions the
