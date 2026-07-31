@@ -1,7 +1,7 @@
 # NIFTY + SENSEX AI Signal Agent
 
 An AI-assisted trading signal agent for Indian markets — **NIFTY 50** and **BSE SENSEX** weekly **and monthly** expiry options.
-Runs two independent strategies (EMA Crossover + VWAP Breakout) every 5 minutes during market hours, each scored through a multi-layer confidence pipeline (RSI analysis + option chain OI levels + heavyweight breadth), fetches **live** option chain premiums via the Upstox API (with automatic fallback to an NSE scrape and finally a VIX-based estimate if live data is unavailable), sends a full pre-market morning brief at 8 AM, and delivers every prediction to your iPhone via Pushover notifications and a Streamlit dashboard.
+Runs six independent strategies (EMA Crossover, VWAP Breakout, Supertrend, MACD Momentum, Opening-Range Breakout, Bollinger Squeeze) every 5 minutes during market hours, scores each through a multi-layer confidence pipeline (RSI + weekly/monthly option-chain OI + heavyweight breadth + global cues), then **folds them into a single consensus verdict** per index. It fetches **live** option premiums via the Upstox API (with automatic fallback to an NSE scrape and finally a VIX-based estimate), sends a full pre-market morning brief at 8 AM, scans single stocks for option ideas, and delivers every call to your iPhone via Pushover notifications and a Streamlit dashboard.
 
 > **No automated order placement. Signal generation only.**
 
@@ -95,7 +95,9 @@ tiers, cheapest/most-reliable first, and always shows which tier produced the pr
 Tiers 2–4 apply to NIFTY only (BSE has no scrape-based middle tier — SENSEX goes straight
 from Upstox to the synthetic estimate if Upstox isn't configured). Whichever contract is
 nearest to expiring **today is skipped** — an option with hours left to trade isn't useful
-for a fresh signal, so "weekly" always means the *next* available expiry.
+for a fresh signal, so "weekly" means the *next* available expiry. Set
+`ALLOW_EXPIRY_DAY_OPTIONS=true` in `.env` to trade today's expiry instead (see
+[Expiry-day options](#expiry-day-options)).
 
 ---
 
@@ -129,113 +131,73 @@ for a fresh signal, so "weekly" always means the *next* available expiry.
 
 ## Architecture & Flow Diagram
 
-```
-╔══════════════════════════════════════════════════════════════════════╗
-║               NIFTY + SENSEX AI SIGNAL AGENT                        ║
-╚══════════════════════════════════════════════════════════════════════╝
+### How it works (in six steps)
 
-┌─────────────────────────────────────────────────────────────────────┐
-│                        SCHEDULE LAYER                               │
-│  ┌──────────────────────┐      ┌──────────────────────────────┐    │
-│  │  08:00 AM IST Daily  │      │  Every 5 min (9:15–15:30)   │    │
-│  │   Morning Report     │      │   Intraday Signal Pipeline   │    │
-│  └──────────┬───────────┘      └──────────────┬───────────────┘    │
-└─────────────┼────────────────────────────────┼────────────────────-┘
-              │                                │
-              ▼                                ▼
-╔═════════════════════════╗    ╔══════════════════════════════════════╗
-║    MORNING REPORT       ║    ║        INTRADAY PIPELINE             ║
-╠═════════════════════════╣    ╠══════════════════════════════════════╣
-║                         ║    ║                                      ║
-║  Global Indices         ║    ║  ┌──────────────────────────────┐   ║
-║  (yfinance, 8 markets)  ║    ║  │ DataProvider (NSE+BSE)       │   ║
-║         +               ║    ║  │ · Spot+OHLCV: yfinance       │   ║
-║  GIFT Nifty             ║    ║  │ · Options: Upstox→NSE→VIX est│   ║
-║  (NSE IFSC API)         ║    ║  └──────────────┬───────────────┘   ║
-║         +               ║    ║                 ▼                    ║
-║  NIFTY 50 Stocks        ║    ║  ┌──────────────────────────────┐   ║
-║  · Advance/Decline      ║    ║  │     Indicator Engine         │   ║
-║  · Top 5 gainers        ║    ║  │  EMA20, EMA50, RSI(14)       │   ║
-║  · Top 5 losers         ║    ║  │  MACD(12,26,9), ATR(14)      │   ║
-║         +               ║    ║  │  VWAP                        │   ║
-║  WEEKLY Option Chain    ║    ║  └──────────────┬───────────────┘   ║
-║  · ATM ± 3 strikes      ║    ║                 ▼                    ║
-║  · CE/PE LTP & OI       ║    ║  ┌──────────────────────────────┐   ║
-║  · PCR, Max Pain        ║    ║  │  Strategy Engine (2, indep.) │   ║
-║  · OI resistance/support║    ║  │  1. EMA Crossover (EMA/RSI)  │   ║
-║  · Black-Scholes CE/PE  ║    ║  │  2. VWAP Breakout (VWAP/mom.)│   ║
-║         +               ║    ║  │  Each: BUY_CE/BUY_PE/HOLD    │   ║
-║  MONTHLY Option Chain   ║    ║  │  Confidence: 50–95% each     │   ║
-║  · ATM ± 5 strikes      ║    ║  └──────────────┬───────────────┘   ║
-║  · Monthly max pain     ║    ║                 ▼                    ║
-║  · Monthly PCR          ║    ║  ┌──────────────────────────────┐   ║
-║  · Monthly OI wall/floor║    ║  │   Layer 1: RSI Analyser      │   ║
-║         +               ║    ║  │  · Zone (5 levels)           │   ║
-║  News (RSS, 4 feeds)    ║    ║  │  · Trend (5-bar lookback)    │   ║
-║         +               ║    ║  │  · Divergence detection      │   ║
-║  Claude Daily Plan      ║    ║  │  Δ confidence: −12 to +11   │   ║
-║  (if API key set)       ║    ║  └──────────────┬───────────────┘   ║
-║                         ║    ║                 ▼                    ║
-║  Pushover: 5–6 msgs     ║    ║  ┌──────────────────────────────┐   ║
-║  ① Global + GIFT Nifty  ║    ║  │   Layer 2: Weekly OC Filter  │   ║
-║  ② NIFTY 50 A/D         ║    ║  │  · PCR direction vs signal   │   ║
-║  ③ Weekly OC            ║    ║  │  · CE OI wall proximity      │   ║
-║  ④ Monthly OC           ║    ║  │  · PE OI floor proximity     │   ║
-║  ⑤ News (silent)        ║    ║  │  · Max pain pinning risk     │   ║
-║  ⑥ Claude Plan (HIGH)   ║    ║  │  Cached 15 min (NSE limits)  │   ║
-║                         ║    ║  │  Δ confidence: −22 to +9    │   ║
-╚═════════════════════════╝    ║  └──────────────┬───────────────┘   ║
-                               ║                 ▼                    ║
-                               ║  ┌──────────────────────────────┐   ║
-                               ║  │  Layer 3: Monthly OC Note    │   ║
-                               ║  │  · Monthly PCR bias          │   ║
-                               ║  │  · Monthly CE wall proximity │   ║
-                               ║  │  · Monthly PE floor          │   ║
-                               ║  │  · Monthly pin risk (DTE≤3)  │   ║
-                               ║  │  Δ confidence: −14 to +3    │   ║
-                               ║  └──────────────┬───────────────┘   ║
-                               ║                 ▼                    ║
-                               ║  ┌──────────────────────────────┐   ║
-                               ║  │  Layer 4: Breadth Check      │   ║
-                               ║  │  Top 10 heavyweights live:   │   ║
-                               ║  │  HDFCBANK, Reliance, ICICI   │   ║
-                               ║  │  Infy, TCS, L&T, Kotak       │   ║
-                               ║  │  Axis, SBI, Bharti Airtel    │   ║
-                               ║  │  Advance/Decline → score     │   ║
-                               ║  │  Δ confidence: −12 to +8    │   ║
-                               ║  └──────────────┬───────────────┘   ║
-                               ║                 ▼                    ║
-                               ║  ┌──────────────────────────────┐   ║
-                               ║  │      Risk Management         │   ║
-                               ║  │  SL  = Entry ∓ 1.5 × ATR    │   ║
-                               ║  │  Tgt = Entry ± 3.0 × ATR    │   ║
-                               ║  │  RR ≥ 1:2  |  Max risk 1%   │   ║
-                               ║  └──────────────┬───────────────┘   ║
-                               ║                 ▼                    ║
-                               ║  ┌──────────────────────────────┐   ║
-                               ║  │   AI Explainer (optional)    │   ║
-                               ║  │  4 book patterns (RAG)       │   ║
-                               ║  │  All 4 layer deltas visible  │   ║
-                               ║  │  Claude explains in context  │   ║
-                               ║  └──────────────┬───────────────┘   ║
-                               ║                 ▼                    ║
-                               ║  SQLite ──────── Pushover ── Dashboard║
-                               ╚══════════════════════════════════════╝
+1. **A scheduler drives everything.** The `schedule` loop fires eight kinds of job at fixed IST times, each guarded so intraday work only runs 09:15–15:30. Every job ends in one or more Pushover notifications to your phone.
+2. **Market data is Upstox-first.** Spot + 5-minute OHLCV and the live weekly/monthly option chain come from the Upstox API, falling back to an NSE scrape and finally a VIX-based synthetic estimate (always labelled `(Est.)`).
+3. **Indicators are stateless.** RSI, EMA20/50, MACD, ATR and VWAP are recomputed per index every cycle.
+4. **Six strategies vote; one verdict is issued.** Each strategy emits a raw BUY_CE / BUY_PE / HOLD, whose confidence is adjusted by four layers (RSI, weekly OC, monthly OC, breadth) plus global cues. The **consensus engine** weights the six by time-of-day and folds them into a single verdict — and returns `NO_TRADE` for fresh entries after the **15:20** cutoff.
+5. **Risk + margin gate the call.** ATR-based SL / target / RR and a SPAN-style margin + lot-sizing check are applied before anything is sent.
+6. **It explains, stores, and notifies.** Claude explains the verdict using trading-book patterns; the call is saved to SQLite, pushed to your iPhone, and shown on the Streamlit dashboard.
 
-┌──────────────────────────────────────────────────────────────────────┐
-│                  STREAMLIT DASHBOARD (always on)                     │
-│  Candlestick + EMA20/50 · RSI panel · MACD panel                    │
-│  Signal box (colour-coded) · Entry/SL/Target/RR                      │
-│  AI explanation · Indicator snapshot · Signal history                │
-│  Auto-refresh every 60 seconds                                       │
-└──────────────────────────────────────────────────────────────────────┘
+### Daily schedule
+
+```mermaid
+flowchart LR
+    subgraph PRE["Pre-market & overnight"]
+        direction TB
+        A1["06:45 · GIFT Nifty next-session read"]
+        A2["08:00 · Morning brief (global, A/D, OC, news, Claude plan)"]
+        A3["08:05 + hourly · Upstox token health"]
+        A4["17:00 · GIFT Nifty overnight read"]
+    end
+    subgraph MKT["Market hours · 09:15–15:30"]
+        direction TB
+        B1["Every 5 min · Signal pipeline (per index)"]
+        B2["Every 30 min · Trade plan — buy/sell prices"]
+        B3["Every 30 min · Single-stock CE/PE scan"]
+        B4["Every 30 min · Volatile-stock straddle scan"]
+    end
+    subgraph POST["Post-market"]
+        direction TB
+        C1["16:00 · EOD next-session prediction"]
+    end
+    PRE --> OUT["📲 Pushover → iPhone  ·  🗄 SQLite  ·  📊 Dashboard"]
+    MKT --> OUT
+    POST --> OUT
 ```
 
-> The Intraday Pipeline box runs **twice** every 5 minutes — once for NIFTY
-> (`NSEDataProvider`, ₹50 strikes, weekly expiry Tuesday) and once for SENSEX
-> (`BSEDataProvider`, ₹100 strikes, weekly expiry Thursday) — and within each
-> run, both strategies fire independently, so every cycle produces up to
-> **4 predictions** (2 indices × 2 strategies).
+### Intraday signal pipeline (every 5 min, per index)
+
+```mermaid
+flowchart TD
+    S["Every 5 min · for each index<br/>NIFTY · SENSEX · BANKNIFTY"]
+    D1["Market data<br/>spot + 5-min OHLCV<br/>Upstox → NSE / yfinance"]
+    D2["Live option chain — weekly + monthly<br/>Upstox → NSE scrape → VIX estimate"]
+    IND["Indicator engine<br/>RSI · EMA20/50 · MACD · ATR · VWAP"]
+    STR["Six strategies, independent<br/>EMA Crossover · VWAP Breakout · Supertrend<br/>MACD Momentum · ORB · Bollinger Squeeze"]
+    subgraph ADJ["Confidence adjustment · per strategy signal"]
+        direction TB
+        L1["L1 · RSI zone / trend / divergence"]
+        L2["L2 · Weekly OI: PCR, walls, max pain"]
+        L3["L3 · Monthly OI structure"]
+        L4["L4 · Heavyweight breadth (top 10)"]
+        LG["Global cues · indices · GIFT · VIX · news"]
+    end
+    CON["Consensus engine<br/>time-of-day weights + 15:20 entry cutoff<br/>→ ONE verdict: BUY_CE / BUY_PE / HOLD"]
+    RSK["Risk · ATR SL 1.5x · target 3.0x · RR ≥ 1:2"]
+    MRG["Margin engine · SPAN + lots vs capital<br/>1% risk rule · daily-loss cap"]
+    AIX["AI explainer · Claude, if actionable<br/>grounded in trading-book patterns"]
+    OUT["🗄 SQLite  ·  📲 Pushover  ·  📊 Dashboard"]
+
+    S --> D1 --> D2 --> IND --> STR --> ADJ --> CON --> RSK --> MRG --> AIX --> OUT
+```
+
+> The intraday pipeline runs once **per index** — **NIFTY** (`NSEDataProvider`, ₹50
+> strikes, Tuesday weekly), **SENSEX** (`BSEDataProvider`, ₹100 strikes, Thursday
+> weekly) and **BANKNIFTY** (₹100 strikes, plus CE/PE ideas on the constituent banks
+> that confirm the index move). Within each run all six strategies fire, but the
+> consensus engine emits exactly **one** verdict per index per cycle.
 
 ---
 
@@ -253,7 +215,27 @@ The primary source for real option chain data — an authenticated REST API, so 
 no bot detection to work around.
 - **`get_expiries(index_name)`** — fetches available expiry dates from `/v2/option/contract`. Instrument keys: `NSE_INDEX|Nifty 50` (NIFTY), `BSE_INDEX|SENSEX` (SENSEX).
 - **`get_option_chain(index_name, expiry_date)`** — fetches strike-level OI/LTP/IV from `/v2/option/chain`, normalised into the same `strike/ce_oi/pe_oi/ce_ltp/pe_ltp/ce_iv/pe_iv` shape the rest of the pipeline expects.
-- **`drop_expiring_today()`** — an option expiring within hours has no meaningful time left to trade, so any expiry dated today is dropped before picking "weekly" — it always rolls forward to the next available expiry.
+- **`drop_expiring_today()`** — an option expiring within hours has no meaningful time left to trade, so any expiry dated today is dropped before picking "weekly" — it rolls forward to the next available expiry unless `ALLOW_EXPIRY_DAY_OPTIONS=true`.
+
+### Expiry-day options
+
+NIFTY's weekly expiry is **Tuesday** (SENSEX: Thursday). By default the agent will **not**
+suggest the contract expiring that same day. On expiry day the extrinsic value has already
+collapsed and gamma/theta dominate the P&L, so a directional BUY_CE/BUY_PE signal carrying
+a stop-loss and a 1:2 RR target — which is what this system emits — rarely survives contact
+with the tape. The pick rolls forward to the next expiry instead.
+
+If you deliberately trade expiry-day scalps, set:
+
+```bash
+ALLOW_EXPIRY_DAY_OPTIONS=true
+```
+
+That single flag is honoured by all three places the rule is enforced: `drop_expiring_today()`
+(Upstox path), `_drop_expiring_today()` / `_next_weekly_expiry()` (NSE scrape and synthetic
+fallback), and `InstrumentMaster.nearest_expiry()` (the ATM contract picker used for
+bank/stock options). Each also takes an explicit `allow_expiry_day` argument that overrides
+the setting, which is what the tests use.
 - Auth uses a read-only access token in `UPSTOX_ACCESS_TOKEN`. Simplest is an **Analytics Access Token** (market-data only, valid ~1 year, no refresh); alternatively [`scripts/upstox_login.py`](#setup--installation) writes a daily-expiring OAuth token. See [Setup](#setup--installation).
 
 #### `nse_provider.py` — NSEDataProvider (NIFTY)
@@ -345,9 +327,15 @@ All stateless pure functions — take a DataFrame, return a DataFrame with an ex
 
 ### 4. Strategy Engine (`nifty_ai_agent/strategies/`)
 
-Both strategies below run **independently, every cycle** — neither one "wins"; each
-produces its own signal, gets its own confidence score, and is saved/notified separately
-(`main.py`'s `_STRATEGIES` list). Adding a third strategy is a one-line addition to that list.
+**Six strategies run independently, every cycle** — EMA Crossover, VWAP Breakout,
+Supertrend, MACD Momentum, Opening-Range Breakout and Bollinger Squeeze. Each produces
+its own signal and confidence score, and every vote is still saved for review; but rather
+than sending six alerts, the **consensus engine** (`consensus.py`) weights them by
+intraday suitability and time-of-day and folds them into one verdict — a split book
+returns `NO_TRADE` instead of picking the marginally louder half, and no fresh entry is
+taken after the **15:20** cutoff. Adding a strategy is a one-line addition to `main.py`'s
+`_STRATEGIES` list. The two original strategies are detailed below; the other four follow
+the same `BaseStrategy.generate_signal()` contract.
 
 #### `ema_crossover.py` — EMA Crossover
 ```
@@ -699,7 +687,8 @@ python -m pytest tests/ -v
 
 ### Without any optional keys (free)
 - Morning report: global markets, NIFTY 50 A/D, weekly OC, monthly OC, news
-- 5-min intraday signals for NIFTY + SENSEX, 2 strategies each, full 4-layer confidence scoring
+- 5-min intraday signals for NIFTY, SENSEX + BANKNIFTY — six strategies folded into one consensus verdict, full 4-layer confidence scoring
+- Scheduled single-stock option scan and volatile-stock straddle scan across the NIFTY 50
 - Option chain prices via NSE scrape / VIX-based synthetic estimate (clearly labelled if not live)
 - Risk parameters (SL, target, RR)
 - Streamlit dashboard
@@ -820,6 +809,11 @@ market_analysyis/
 - ✅ **Bank Nifty support** — BANKNIFTY chain with strike step 100, plus CE/PE suggestions on the individual constituent banks that confirm the index move *(done)*
 - ✅ **Global cues in intraday signals** — global index bias, GIFT Nifty, India VIX regime, and RSS headline sentiment now adjust intraday confidence, not just the 08:00 report *(done)*
 - ✅ **GIFT Nifty next-session outlook** — live NSE IX feed drives an implied-open forecast at 17:00 (Session 2 open) and 06:45 (Session 1 open), each paired with the historical base rate for that gap size *(done)*
+- ✅ **Single-stock option scan** — a scheduled digest of monthly CE/PE ideas across the NIFTY 50, run through the same indicator + consensus stack as the index loop *(done)*
+- ✅ **Volatile-stock straddle scan** — ranks the NIFTY 50 by realised volatility (ATR %) and suggests ATM long straddles (CE+PE) on the most volatile names for a direction-agnostic move *(done)*
+- ✅ **Upstox-first stock data** — the stock scans pull cash-market OHLCV from Upstox with an automatic yfinance fallback, matching the index path *(done)*
+- **Straddle exit / adjustment rules** — the straddle scan is entry-only today; add theta-aware exit and roll triggers so a long-vol position is managed, not just opened
+- **Broader F&O universe** — extend both stock scans from the NIFTY 50 to the full ~180-name F&O list (with per-name rate limiting)
 - **Gap-aware opening strategy** — let the 09:15 open consume the gap base rate directly (e.g. suppress BUY_CE on a large gap-up, which has historically faded) rather than only reporting it
 - **Option Greeks** (Delta, Theta, Gamma, Vega) derived from chain IV — show P/L sensitivity for each signal
 - **OI change tracking** — compare current OI to previous fetch to detect fresh accumulation vs unwinding

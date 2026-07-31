@@ -13,6 +13,7 @@ from nifty_ai_agent.data.nse_provider import (
     _drop_expiring_today,
     _identify_expiries,
     _iso_to_nse_date,
+    _next_weekly_expiry,
     _nse_date_to_iso,
 )
 
@@ -179,7 +180,8 @@ class TestNSEDataProvider:
         assert len(chain.strikes) == 2       # only weekly rows
         assert len(chain.monthly_strikes) == 1  # only monthly rows
 
-    def test_get_option_chain_skips_expiry_dated_today(self, provider):
+    def test_get_option_chain_skips_expiry_dated_today(self, provider, monkeypatch):
+        monkeypatch.setenv("ALLOW_EXPIRY_DAY_OPTIONS", "false")
         today = date.today().strftime("%d-%b-%Y")
         next_week = (date.today() + timedelta(days=7)).strftime("%d-%b-%Y")
         mock_json = {
@@ -405,17 +407,50 @@ class TestDropExpiringTodayNseFormat:
     def test_drops_todays_date(self):
         today = date.today().strftime("%d-%b-%Y")
         future = (date.today() + timedelta(days=7)).strftime("%d-%b-%Y")
-        assert _drop_expiring_today([today, future]) == [future]
+        assert _drop_expiring_today([today, future], allow_expiry_day=False) == [future]
 
     def test_keeps_list_unchanged_when_today_absent(self):
         dates = [
             (date.today() + timedelta(days=i)).strftime("%d-%b-%Y") for i in (7, 14)
         ]
-        assert _drop_expiring_today(dates) == dates
+        assert _drop_expiring_today(dates, allow_expiry_day=False) == dates
 
     def test_falls_back_to_original_if_only_today_present(self):
         today = date.today().strftime("%d-%b-%Y")
-        assert _drop_expiring_today([today]) == [today]
+        assert _drop_expiring_today([today], allow_expiry_day=False) == [today]
+
+    def test_keeps_todays_date_when_expiry_day_allowed(self):
+        today = date.today().strftime("%d-%b-%Y")
+        future = (date.today() + timedelta(days=7)).strftime("%d-%b-%Y")
+        assert _drop_expiring_today([today, future], allow_expiry_day=True) == [today, future]
+
+    def test_reads_setting_when_flag_not_passed(self, monkeypatch):
+        today = date.today().strftime("%d-%b-%Y")
+        future = (date.today() + timedelta(days=7)).strftime("%d-%b-%Y")
+        monkeypatch.setenv("ALLOW_EXPIRY_DAY_OPTIONS", "true")
+        assert _drop_expiring_today([today, future]) == [today, future]
+        monkeypatch.setenv("ALLOW_EXPIRY_DAY_OPTIONS", "false")
+        assert _drop_expiring_today([today, future]) == [future]
+
+
+class TestNextWeeklyExpiry:
+    def test_rolls_past_today_on_a_tuesday(self):
+        """On expiry day itself the synthetic chain must point at next Tuesday."""
+        expiry = datetime.strptime(
+            _next_weekly_expiry(allow_expiry_day=False), "%d-%b-%Y"
+        ).date()
+        assert expiry.weekday() == 1  # Tuesday
+        assert expiry > date.today()
+
+    def test_returns_today_on_a_tuesday_when_expiry_day_allowed(self):
+        expiry = datetime.strptime(
+            _next_weekly_expiry(allow_expiry_day=True), "%d-%b-%Y"
+        ).date()
+        assert expiry.weekday() == 1
+        if date.today().weekday() == 1:
+            assert expiry == date.today()
+        else:
+            assert expiry > date.today()
 
 
 class TestIdentifyExpiries:

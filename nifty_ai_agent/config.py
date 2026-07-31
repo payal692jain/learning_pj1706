@@ -54,12 +54,23 @@ class Settings(BaseSettings):
         description="yfinance bar interval: 5m for live intraday, 1d for EOD/backtesting",
     )
 
-    # ── Trade plan (capital-aware sizing in the plan notification) ──
-    trading_capital: float = Field(
-        default=50000.0, description="Deployable capital in INR for the trade-plan notification"
+    allow_expiry_day_options: bool = Field(
+        default=False,
+        description=(
+            "Allow suggesting the contract that expires today. Off by default: on expiry "
+            "day the extrinsic value has collapsed and gamma/theta dominate, so a "
+            "directional signal with an SL and a 1:2 RR target rarely survives. "
+            "Turn on only if you deliberately trade expiry-day scalps."
+        ),
     )
-    daily_profit_target: float = Field(
-        default=10000.0, description="Daily profit goal in INR shown in the trade-plan notification"
+
+    # ── Capital ────────────────────────────────────────────────
+    trading_capital: float = Field(
+        default=50000.0,
+        description=(
+            "Deployable capital in INR — sizes the margin/lots section of the signal "
+            "notification. The trade plan itself is prices-only and ignores this."
+        ),
     )
 
     # ── Risk ───────────────────────────────────────────────────
@@ -91,9 +102,49 @@ class Settings(BaseSettings):
         default=100.0,
         description="Share of capital that may be committed as margin (below 100 keeps a buffer)",
     )
-    margin_report_interval_minutes: int = Field(
-        default=15,
-        description="How often the standalone risk & margin notification is sent",
+
+    # ── Stock option scan (NIFTY 50 constituents) ──────────────
+    stock_scan_enabled: bool = Field(
+        default=True,
+        description="Run the scheduled single-stock monthly-option scan across NIFTY 50 constituents",
+    )
+    stock_scan_interval_minutes: int = Field(
+        default=30,
+        description=(
+            "How often (minutes) to run the single-stock CE/PE scan during market "
+            "hours. Runs are market-hours guarded, so this only fires 09:15–15:30."
+        ),
+    )
+    stock_scan_top_n: int = Field(
+        default=5, description="How many top stock ideas to include in the scan notification"
+    )
+    stock_default_iv: float = Field(
+        default=0.30,
+        description=(
+            "Annualised IV (decimal) for the Black-Scholes premium fallback when no "
+            "live stock-option quote is available — stocks run hotter than the index, "
+            "so this defaults above the index VIX"
+        ),
+    )
+
+    # ── Volatile-stock straddle scan (long-volatility plays) ────
+    volatility_scan_enabled: bool = Field(
+        default=True,
+        description=(
+            "Run the scheduled scan that ranks NIFTY 50 constituents by realised "
+            "volatility (ATR %) and suggests an ATM long straddle (buy CE + PE) on "
+            "the most volatile names — a direction-agnostic play on a big move"
+        ),
+    )
+    volatility_scan_interval_minutes: int = Field(
+        default=30,
+        description=(
+            "How often (minutes) to run the volatile-stock straddle scan during "
+            "market hours. Runs are market-hours guarded, so this only fires 09:15–15:30."
+        ),
+    )
+    volatility_scan_top_n: int = Field(
+        default=5, description="How many top volatile-stock straddles to include in the scan notification"
     )
 
     # ── Logging ────────────────────────────────────────────────

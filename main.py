@@ -7,6 +7,7 @@ Scheduled jobs (all IST):
   every 5 min  — intraday signal pipeline → one consensus trade call per index
   every 15 min — risk & margin report (sent whatever the signals say)
   every 30 min — capital-aware trade plan across all three indices
+  09:45, 14:00 — single-stock monthly-option scan across NIFTY 50 (configurable)
   16:00        — EOD prediction for the next session
   17:00        — next-session outlook (GIFT Nifty Session 2 has opened; first overnight read)
 
@@ -23,7 +24,6 @@ import logging
 import time
 from typing import Callable, NamedTuple
 
-import pandas as pd
 import pytz
 import schedule
 from datetime import date, datetime, timedelta
@@ -33,28 +33,21 @@ from nifty_ai_agent.config import configure_logging, get_settings
 from nifty_ai_agent.data.bank_options import BankOptionIdea, suggest_bank_options
 from nifty_ai_agent.data.banknifty_breadth import fetch_banknifty_breadth
 from nifty_ai_agent.data.gift_nifty import build_outlook, fetch_gift_nifty
+from nifty_ai_agent.data.instrument_master import get_instrument_master
+from nifty_ai_agent.data.nifty50_stocks import NIFTY50_SYMBOLS
+from nifty_ai_agent.data.stock_data import fetch_stock_histories
 from nifty_ai_agent.data.token_health import TokenMonitor
 from nifty_ai_agent.data.breadth import BreadthSnapshot, fetch_realtime_breadth
 from nifty_ai_agent.data.bse_provider import BSEDataProvider
 from nifty_ai_agent.data.nse_provider import NSEDataProvider
 from nifty_ai_agent.data.sensex_breadth import fetch_sensex_breadth
 from nifty_ai_agent.database.repository import DatabaseRepository
-from nifty_ai_agent.indicators.atr import compute_atr
-from nifty_ai_agent.indicators.bollinger import compute_bollinger
-from nifty_ai_agent.indicators.ema import compute_ema
-from nifty_ai_agent.indicators.macd import compute_macd
-from nifty_ai_agent.indicators.rsi import compute_rsi
-from nifty_ai_agent.indicators.supertrend import compute_supertrend
-from nifty_ai_agent.indicators.vwap import compute_vwap
 from nifty_ai_agent.notifier.pushover import PushoverNotifier
-from nifty_ai_agent.reports.margin_report import (
-    IndexMarginView,
-    build_index_margin_view,
-    format_margin_report,
-)
 from nifty_ai_agent.reports.morning_report import run_morning_report
 from nifty_ai_agent.reports.next_session import format_next_session
 from nifty_ai_agent.reports.trade_call import format_trade_call
+from nifty_ai_agent.reports.stock_scan import format_stock_scan
+from nifty_ai_agent.reports.volatility_scan import format_volatility_scan
 from nifty_ai_agent.reports.trade_plan import (
     FALLBACK_LOT_SIZES,
     TradeIdea,
@@ -64,7 +57,6 @@ from nifty_ai_agent.reports.trade_plan import (
 from nifty_ai_agent.risk.calculator import RiskCalculator, RiskParameters
 from nifty_ai_agent.risk.margin import MarginCalculator
 from nifty_ai_agent.strategies.base import BaseStrategy, Signal, SignalType
-from nifty_ai_agent.strategies.bollinger_squeeze import BollingerSqueezeStrategy
 from nifty_ai_agent.strategies.consensus import Consensus, build_consensus
 from nifty_ai_agent.strategies.gap_analyser import analyse_gap_history, compute_pivots
 from nifty_ai_agent.strategies.global_analyser import (
@@ -72,11 +64,9 @@ from nifty_ai_agent.strategies.global_analyser import (
     fetch_global_snapshot,
     global_confidence_adjustment,
 )
-from nifty_ai_agent.strategies.ema_crossover import EMACrossoverStrategy
-from nifty_ai_agent.strategies.macd_momentum import MACDMomentumStrategy
-from nifty_ai_agent.strategies.orb import OpeningRangeBreakoutStrategy
-from nifty_ai_agent.strategies.supertrend import SupertrendStrategy
-from nifty_ai_agent.strategies.vwap_breakout import VWAPBreakoutStrategy
+from nifty_ai_agent.strategies.pipeline import compute_all_indicators, DEFAULT_STRATEGIES
+from nifty_ai_agent.strategies.stock_scanner import scan_stocks
+from nifty_ai_agent.strategies.volatility_scanner import scan_volatile_straddles
 from nifty_ai_agent.strategies.option_analyser import (
     ExpiryAnalysis,
     analyse_option_chain,
@@ -108,27 +98,11 @@ class IndexConfig(NamedTuple):
 _INDEX_CONFIGS: list[IndexConfig] = []
 
 # Every strategy runs independently each cycle — all of their predictions are
-# saved and notified, not just one "winning" signal.
-_STRATEGIES: list[BaseStrategy] = [
-    EMACrossoverStrategy(),
-    VWAPBreakoutStrategy(),
-    SupertrendStrategy(),
-    MACDMomentumStrategy(),
-    OpeningRangeBreakoutStrategy(),
-    BollingerSqueezeStrategy(),
-]
-
-
-def _compute_indicators(hist: pd.DataFrame) -> pd.DataFrame:
-    """Attach every indicator column the strategy engine reads to *hist*."""
-    df = compute_ema(hist, periods=[20, 50])
-    df = compute_rsi(df)
-    df = compute_macd(df)
-    df = compute_atr(df)
-    df = compute_vwap(df)
-    df = compute_supertrend(df)
-    df = compute_bollinger(df)
-    return df
+# saved and notified, not just one "winning" signal. The strategy book and the
+# indicator set both live in strategies/pipeline.py so the stock scanner runs
+# on identical machinery.
+_STRATEGIES: list[BaseStrategy] = DEFAULT_STRATEGIES
+_compute_indicators = compute_all_indicators
 
 
 def _is_market_hours() -> bool:
@@ -141,8 +115,13 @@ def _is_market_hours() -> bool:
     return open_time <= now_ist <= close_time
 
 
-# ── Option chain cache (per index, refreshed every 15 min) ──────────────────────
-_OPTION_CACHE_TTL = 15  # minutes
+# ── Option chain cache (per index) ──────────────────────────────────────────────
+# TTL is tied to the signal-loop interval (default 5 min) so the ATM premium a
+# trade call quotes is re-fetched every cycle rather than lingering up to 15 min
+# behind the live index. The trade call still reprices the premium onto the live
+# spot as a second guard, but a tight TTL keeps that adjustment small. Cost: one
+# option-chain API call per index per cycle — the intended trade-off for a "Buy ₹"
+# figure that tracks the live value.
 _option_caches: dict[str, dict] = {}   # keyed by index name ("NIFTY", "SENSEX")
 
 
@@ -185,10 +164,11 @@ def _get_cached_option_analysis(
     )
     now = datetime.now(_IST)
     fetched_at = cache["fetched_at"]
+    ttl_minutes = get_settings().data_fetch_interval_minutes
 
     if fetched_at is not None:
         age_minutes = (now - fetched_at).total_seconds() / 60
-        if age_minutes < _OPTION_CACHE_TTL:
+        if age_minutes < ttl_minutes:
             logger.debug("%s option chain cache hit (%.1f min old)", index.name, age_minutes)
             return cache["weekly"], cache["monthly"]
 
@@ -717,10 +697,7 @@ def _build_index_trade_idea(index: IndexConfig, settings) -> TradeIdea | None:
         atr_sl_multiplier=settings.atr_sl_multiplier,
     ).calculate(best.signal, spot.price, float(latest["atr"]))
 
-    return build_trade_idea(
-        index.name, best.signal, best.confidence, oc_weekly, risk,
-        _get_lot_size(index.name),
-    )
+    return build_trade_idea(index.name, best.signal, best.confidence, oc_weekly, risk)
 
 
 def _run_trade_plan() -> None:
@@ -740,9 +717,7 @@ def _run_trade_plan() -> None:
             idea = None
         (ideas.append(idea) if idea else holds.append(index.name))
 
-    title, body = format_trade_plan(
-        ideas, holds, settings.trading_capital, settings.daily_profit_target,
-    )
+    title, body = format_trade_plan(ideas, holds)
     try:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
@@ -753,76 +728,141 @@ def _run_trade_plan() -> None:
         logger.error("Trade plan Pushover failed: %s", exc)
 
 
-# ── Risk & margin report (sent every cycle, regardless of signals) ─────────────
+# ── Stock option scan (NIFTY 50 constituents) ──────────────────────────────────
 
-def _build_index_margin_view(index: IndexConfig, settings) -> IndexMarginView | None:
-    """Price the future and both ATM option legs for one index, sized against capital."""
-    provider = index.make_provider()
-    spot = provider.get_spot_data()
-    hist = provider.get_historical_data(
-        days=settings.historical_days, interval=settings.data_interval,
-    )
-    df = _compute_indicators(hist)
-    latest = df.dropna(subset=["atr"]).iloc[-1]
+def _stock_premium_lookup(token: str):
+    """Return an instrument_key → LTP lookup, or a no-op estimator when no token.
 
-    oc_weekly, _ = _get_cached_option_analysis(index, provider, spot.price)
-    if oc_weekly is None:
-        logger.warning("%s: no option chain — margin view unavailable.", index.name)
-        return None
-
-    calculator = MarginCalculator(
-        capital=settings.trading_capital,
-        max_risk_per_trade_pct=settings.max_risk_per_trade_pct,
-        daily_loss_limit_pct=settings.daily_loss_limit_pct,
-        max_margin_utilisation_pct=settings.max_margin_utilisation_pct,
-    )
-    return build_index_margin_view(
-        index_name=index.name,
-        analysis=oc_weekly,
-        atr=float(latest["atr"]),
-        lot_size=_get_lot_size(index.name),
-        calculator=calculator,
-        atr_sl_multiplier=settings.atr_sl_multiplier,
-    )
-
-
-def _run_margin_report() -> None:
-    """Send the standalone risk & margin notification for every index.
-
-    Sent on its own schedule and independently of any signal — a HOLD cycle still
-    needs to tell you what a position would cost and whether it fits the account.
+    Stock strikes/lots resolve from the (tokenless) instrument master, but live
+    premiums need an authenticated quote — without a token the scan still runs and
+    quotes Black-Scholes estimates instead.
     """
+    if not token:
+        return None
+    from nifty_ai_agent.data.upstox_provider import UpstoxClient
+
+    client = UpstoxClient(token)
+
+    def _lookup(instrument_keys: list[str]) -> dict[str, float]:
+        return client.get_ltp(instrument_keys)
+
+    return _lookup
+
+
+def _run_stock_scan() -> None:
+    """Scan the NIFTY 50 constituents for monthly-option ideas and send one digest."""
+    settings = get_settings()
+    if not settings.stock_scan_enabled:
+        logger.info("Stock scan disabled — skipping.")
+        return
     if not _is_market_hours():
-        logger.info("Margin report: outside market hours — skipping.")
+        logger.info("Stock scan: outside market hours — skipping.")
         return
 
-    settings = get_settings()
-    views: list[IndexMarginView] = []
-    for index in _INDEX_CONFIGS:
-        try:
-            view = _build_index_margin_view(index, settings)
-        except Exception as exc:
-            logger.error("Margin report: %s failed: %s", index.name, exc)
-            continue
-        if view:
-            views.append(view)
+    logger.info("=== STOCK SCAN (%d symbols) ===", len(NIFTY50_SYMBOLS))
+    try:
+        histories, spots = fetch_stock_histories(
+            NIFTY50_SYMBOLS,
+            interval=settings.data_interval,
+            upstox_token=settings.upstox_access_token,
+            master=get_instrument_master(),
+        )
+    except Exception as exc:
+        logger.error("Stock scan: history fetch failed: %s", exc)
+        return
 
-    calculator = MarginCalculator(
-        capital=settings.trading_capital,
-        max_risk_per_trade_pct=settings.max_risk_per_trade_pct,
+    if not histories:
+        logger.warning("Stock scan: no usable histories — skipping.")
+        return
+
+    risk_calculator = RiskCalculator(
+        max_risk_pct=settings.max_risk_per_trade_pct,
         daily_loss_limit_pct=settings.daily_loss_limit_pct,
-        max_margin_utilisation_pct=settings.max_margin_utilisation_pct,
+        min_rr=settings.min_risk_reward_ratio,
+        atr_sl_multiplier=settings.atr_sl_multiplier,
     )
-    title, body = format_margin_report(views, calculator)
+    lookup = _stock_premium_lookup(settings.upstox_access_token)
 
+    result = scan_stocks(
+        histories,
+        spots,
+        master=get_instrument_master(),
+        risk_calculator=risk_calculator,
+        now=datetime.now(_IST).time(),
+        premium_lookup=lookup if lookup is not None else (lambda keys: {}),
+        default_iv=settings.stock_default_iv,
+        top_n=settings.stock_scan_top_n,
+    )
+
+    title, body = format_stock_scan(result)
+    # Running every 30 min, a "no setups" digest should not buzz the phone — only an
+    # actual CE/PE idea earns a sound; empty scans go out silent (priority -1).
+    priority = 0 if result.ideas else -1
     try:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
-        ).send_text(title=title, message=body, monospace=True)
-        logger.info("Margin report sent (%d indices)", len(views))
+        ).send_text(title=title, message=body, priority=priority, monospace=True)
+        logger.info(
+            "Stock scan sent: %d ideas (%d actionable, %d errors)",
+            len(result.ideas), result.actionable, result.errors,
+        )
     except Exception as exc:
-        logger.error("Margin report Pushover failed: %s", exc)
+        logger.error("Stock scan Pushover failed: %s", exc)
+
+
+# ── Volatile-stock straddle scan (long-volatility CE+PE ideas) ──────────────────
+
+def _run_volatility_scan() -> None:
+    """Rank NIFTY 50 by ATR% and send one digest of ATM straddles on the most volatile."""
+    settings = get_settings()
+    if not settings.volatility_scan_enabled:
+        logger.info("Volatility scan disabled — skipping.")
+        return
+    if not _is_market_hours():
+        logger.info("Volatility scan: outside market hours — skipping.")
+        return
+
+    logger.info("=== VOLATILITY SCAN (%d symbols) ===", len(NIFTY50_SYMBOLS))
+    try:
+        histories, spots = fetch_stock_histories(
+            NIFTY50_SYMBOLS,
+            interval=settings.data_interval,
+            upstox_token=settings.upstox_access_token,
+            master=get_instrument_master(),
+        )
+    except Exception as exc:
+        logger.error("Volatility scan: history fetch failed: %s", exc)
+        return
+
+    if not histories:
+        logger.warning("Volatility scan: no usable histories — skipping.")
+        return
+
+    lookup = _stock_premium_lookup(settings.upstox_access_token)
+    result = scan_volatile_straddles(
+        histories,
+        spots,
+        master=get_instrument_master(),
+        premium_lookup=lookup if lookup is not None else (lambda keys: {}),
+        default_iv=settings.stock_default_iv,
+        top_n=settings.volatility_scan_top_n,
+    )
+
+    title, body = format_volatility_scan(result)
+    # Silent when there is nothing to trade — only an actual straddle earns a sound.
+    priority = 0 if result.ideas else -1
+    try:
+        PushoverNotifier(
+            user_key=settings.pushover_user_key,
+            api_token=settings.pushover_api_token,
+        ).send_text(title=title, message=body, priority=priority, monospace=True)
+        logger.info(
+            "Volatility scan sent: %d straddles (%d ranked, %d errors)",
+            len(result.ideas), result.ranked, result.errors,
+        )
+    except Exception as exc:
+        logger.error("Volatility scan Pushover failed: %s", exc)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -935,10 +975,18 @@ def main() -> None:
     schedule.every().day.at("08:05").do(_check_token)
     schedule.every().hour.do(_check_token)
     schedule.every(settings.data_fetch_interval_minutes).minutes.do(_run_all_pipelines)
-    schedule.every(30).minutes.do(_run_trade_plan)  # capital-aware plan, all 3 indices
-    # Risk & margin goes out on its own clock so it lands whether or not a signal fired.
-    schedule.every(settings.margin_report_interval_minutes).minutes.do(_run_margin_report)
+    schedule.every(30).minutes.do(_run_trade_plan)  # buy/sell prices, all 3 indices
     schedule.every().day.at("16:00").do(_run_eod_prediction)
+
+    # Single-stock CE/PE scan on a fixed interval (market-hours guarded).
+    if settings.stock_scan_enabled:
+        schedule.every(settings.stock_scan_interval_minutes).minutes.do(_run_stock_scan)
+        logger.info("Stock scan scheduled every %d min", settings.stock_scan_interval_minutes)
+
+    # Volatile-stock straddle scan on a fixed interval (market-hours guarded).
+    if settings.volatility_scan_enabled:
+        schedule.every(settings.volatility_scan_interval_minutes).minutes.do(_run_volatility_scan)
+        logger.info("Volatility scan scheduled every %d min", settings.volatility_scan_interval_minutes)
 
     # ── Immediate startup action ─────────────────────────────────────────────
     _check_token()
@@ -950,7 +998,9 @@ def main() -> None:
     elif now_ist <= market_close:
         logger.info("Market hours — running live pipeline now.")
         _run_all_pipelines()
-        _run_margin_report()
+        _run_trade_plan()
+        _run_stock_scan()
+        _run_volatility_scan()
     else:
         logger.info("Post-market start — running EOD prediction now.")
         _run_eod_prediction()

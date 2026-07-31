@@ -10,6 +10,7 @@ import pandas as pd
 import requests
 import yfinance as yf
 
+from nifty_ai_agent.config import get_settings
 from nifty_ai_agent.data.base import MarketDataProvider, OptionChainData, SpotData
 
 logger = logging.getLogger(__name__)
@@ -425,26 +426,41 @@ class NSEDataProvider(MarketDataProvider):
         return _retry(_fetch)
 
 
-def _next_weekly_expiry() -> str:
+def _next_weekly_expiry(allow_expiry_day: bool | None = None) -> str:
     """Return the nearest upcoming Tuesday as 'DD-Mon-YYYY' (NIFTY weekly expiry).
 
     Confirmed live via the Upstox option-chain API — NSE moved NIFTY's weekly
     (and monthly) expiry off the historical Thursday onto Tuesday.
+
+    On a Tuesday this rolls to next week unless expiry-day options are allowed.
     """
+    if allow_expiry_day is None:
+        allow_expiry_day = get_settings().allow_expiry_day_options
+
     today = date.today()
     days_ahead = (1 - today.weekday()) % 7  # 1 = Tuesday
-    if days_ahead == 0:
+    if days_ahead == 0 and not allow_expiry_day:
         days_ahead = 7
     return (today + timedelta(days=days_ahead)).strftime("%d-%b-%Y")
 
 
-def _drop_expiring_today(expiry_dates: list[str]) -> list[str]:
+def _drop_expiring_today(
+    expiry_dates: list[str], allow_expiry_day: bool | None = None
+) -> list[str]:
     """Drop any expiry dated today from an NSE-format ('DD-Mon-YYYY') list.
 
     An option expiring within hours has no meaningful time left to trade, so
     the "weekly" pick should roll forward to the next available expiry
     instead. Falls back to the original list if that would leave nothing.
+
+    Set ALLOW_EXPIRY_DAY_OPTIONS=true to keep today's expiry instead;
+    *allow_expiry_day* overrides that setting when passed explicitly.
     """
+    if allow_expiry_day is None:
+        allow_expiry_day = get_settings().allow_expiry_day_options
+    if allow_expiry_day:
+        return expiry_dates
+
     today_str = date.today().strftime("%d-%b-%Y")
     filtered = [d for d in expiry_dates if d != today_str]
     return filtered if filtered else expiry_dates

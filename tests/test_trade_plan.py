@@ -1,6 +1,4 @@
-"""Tests for the capital-aware trade plan builder and formatter."""
-
-import pytest
+"""Tests for the trade plan builder and formatter (prices only — no sizing)."""
 
 from nifty_ai_agent.reports.trade_plan import (
     FALLBACK_LOT_SIZES,
@@ -29,30 +27,29 @@ def _risk(sig: SignalType, spot: float = 24200.0):
     return RiskCalculator().calculate(sig, spot, spot * 0.004)
 
 
-def _idea(entry: float = 100.0, target: float = 180.0, sl: float = 60.0,
-          lot: int = 65) -> TradeIdea:
+def _idea(entry: float = 100.0, target: float = 180.0, sl: float = 60.0) -> TradeIdea:
     return TradeIdea(
         index_name="NIFTY", signal="BUY_CE", confidence=74, strike=24200,
         opt_type="CE", expiry="14-Jul-2026", entry_premium=entry,
-        target_sell=target, sl_sell=sl, lot_size=lot, is_live=True,
+        target_sell=target, sl_sell=sl, is_live=True,
     )
 
 
 class TestBuildTradeIdea:
     def test_hold_returns_none(self):
         assert build_trade_idea(
-            "NIFTY", SignalType.HOLD, 50, _analysis(), _risk(SignalType.BUY_CE), 65,
+            "NIFTY", SignalType.HOLD, 50, _analysis(), _risk(SignalType.BUY_CE),
         ) is None
 
     def test_zero_premium_returns_none(self):
         analysis = _analysis(ce_ltp=0.0)
         assert build_trade_idea(
-            "NIFTY", SignalType.BUY_CE, 74, analysis, _risk(SignalType.BUY_CE), 65,
+            "NIFTY", SignalType.BUY_CE, 74, analysis, _risk(SignalType.BUY_CE),
         ) is None
 
     def test_buy_ce_sell_prices_bracket_entry(self):
         idea = build_trade_idea(
-            "NIFTY", SignalType.BUY_CE, 74, _analysis(), _risk(SignalType.BUY_CE), 65,
+            "NIFTY", SignalType.BUY_CE, 74, _analysis(), _risk(SignalType.BUY_CE),
         )
         # Index target is above entry for CE → premium gains; SL below → loses.
         assert idea.target_sell > idea.entry_premium
@@ -61,58 +58,54 @@ class TestBuildTradeIdea:
 
     def test_buy_pe_sell_prices_bracket_entry(self):
         idea = build_trade_idea(
-            "NIFTY", SignalType.BUY_PE, 60, _analysis(), _risk(SignalType.BUY_PE), 65,
+            "NIFTY", SignalType.BUY_PE, 60, _analysis(), _risk(SignalType.BUY_PE),
         )
         assert idea.target_sell > idea.entry_premium
         assert idea.sl_sell < idea.entry_premium
         assert idea.opt_type == "PE"
 
-    def test_lot_economics_properties(self):
-        idea = _idea(entry=100.0, target=180.0, sl=60.0, lot=65)
-        assert idea.cost_per_lot == 6500.0
-        assert idea.pnl_target_per_lot == pytest.approx(80.0 * 65)
-        assert idea.pnl_sl_per_lot == pytest.approx(-40.0 * 65)
-
 
 class TestFormatTradePlan:
-    def test_reachable_target_flagged_with_check(self):
-        # +₹5,200/lot at target, 7 lots affordable → ₹10k needs 2 lots → reachable
-        _, body = format_trade_plan([_idea()], [], 50000, 10000)
-        assert "✓ NIFTY: ₹10,000 needs 2 lot(s)" in body
+    def test_buy_sell_exit_prices_shown(self):
+        _, body = format_trade_plan([_idea()], [])
+        buy_row = next(l for l in body.splitlines() if l.startswith("Buy ₹"))
+        sell_row = next(l for l in body.splitlines() if l.startswith("Sell ₹"))
+        exit_row = next(l for l in body.splitlines() if l.startswith("Exit ₹"))
+        assert "100" in buy_row
+        assert "180" in sell_row
+        assert "60" in exit_row
 
-    def test_unreachable_target_flagged_honestly(self):
-        # Tiny move: +₹5/lot at target → needs 2000 lots — flag NOT reachable.
-        idea = _idea(entry=100.0, target=100.1, sl=60.0, lot=50)
-        _, body = format_trade_plan([idea], [], 50000, 10000)
-        assert "NOT reachable" in body
+    def test_strike_and_expiry_shown(self):
+        _, body = format_trade_plan([_idea()], [])
+        assert "24200CE" in body
+        assert "14-Jul" in body
 
-    def test_unaffordable_lot_flagged(self):
-        idea = _idea(entry=1000.0, lot=65)  # 1 lot = ₹65,000 > ₹50,000
-        _, body = format_trade_plan([idea], [], 50000, 10000)
-        assert "1 lot ₹65,000 > capital ₹50,000" in body
+    def test_no_capital_or_sizing_anywhere(self):
+        """The whole point of the prices-only plan: no rupee capital, no lots."""
+        _, body = format_trade_plan([_idea()], ["SENSEX"])
+        for banned in ("Capital", "Lot qty", "Lots/cap", "1lot", "P/L", "50,000", "lot(s)"):
+            assert banned not in body
 
     def test_holds_listed(self):
-        title, body = format_trade_plan([], ["NIFTY", "SENSEX"], 50000, 10000)
+        title, body = format_trade_plan([], ["NIFTY", "SENSEX"])
         assert "NIFTY: HOLD" in body
         assert "SENSEX: HOLD" in body
         assert "NIFTY —" in title
 
-    def test_sell_and_exit_prices_shown(self):
-        _, body = format_trade_plan([_idea()], [], 50000, 10000)
-        sell_row = next(l for l in body.splitlines() if l.startswith("Sell ₹"))
-        exit_row = next(l for l in body.splitlines() if l.startswith("Exit ₹"))
-        assert "180" in sell_row
-        assert "60" in exit_row
-
     def test_disclaimer_always_present(self):
-        _, body = format_trade_plan([], ["NIFTY"], 50000, 10000)
+        _, body = format_trade_plan([], ["NIFTY"])
         assert "not guarantees" in body
-        assert "20%/day" in body
+
+    def test_estimated_premiums_flagged_with_star(self):
+        idea = _idea()
+        idea.is_live = False
+        _, body = format_trade_plan([idea], [])
+        assert "NIFTY*" in body
 
     def test_title_summarises_all_indices(self):
         pe = _idea()
         pe.index_name, pe.opt_type = "SENSEX", "PE"
-        title, _ = format_trade_plan([_idea(), pe], ["BANKNIFTY"], 50000, 10000)
+        title, _ = format_trade_plan([_idea(), pe], ["BANKNIFTY"])
         assert "NIFTY CE" in title
         assert "SENSEX PE" in title
         assert "BANKNIFTY —" in title

@@ -20,6 +20,8 @@ from pathlib import Path
 
 import requests
 
+from nifty_ai_agent.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 _MASTER_URL = "https://assets.upstox.com/market-quote/instruments/exchange/NSE.json.gz"
@@ -130,21 +132,37 @@ class InstrumentMaster:
             )
         return contracts
 
-    def nearest_expiry(self, asset_symbol: str) -> date | None:
+    def nearest_expiry(
+        self, asset_symbol: str, allow_expiry_day: bool | None = None
+    ) -> date | None:
         """The soonest expiry that is not today.
 
         An option expiring in hours has no time value left to trade, so a
         suggestion to buy one is a suggestion to buy a lottery ticket.
+
+        Set ALLOW_EXPIRY_DAY_OPTIONS=true to include today's expiry anyway;
+        *allow_expiry_day* overrides that setting when passed explicitly.
         """
+        if allow_expiry_day is None:
+            allow_expiry_day = get_settings().allow_expiry_day_options
+
         today = date.today()
-        expiries = {c.expiry for c in self.option_contracts(asset_symbol) if c.expiry > today}
+        expiries = {
+            c.expiry for c in self.option_contracts(asset_symbol)
+            if (c.expiry >= today if allow_expiry_day else c.expiry > today)
+        }
         return min(expiries) if expiries else None
 
     def atm_contract(
-        self, asset_symbol: str, spot: float, opt_type: str, expiry: date | None = None,
+        self,
+        asset_symbol: str,
+        spot: float,
+        opt_type: str,
+        expiry: date | None = None,
+        allow_expiry_day: bool | None = None,
     ) -> OptionContract | None:
         """The contract whose strike sits closest to *spot* for the given expiry."""
-        expiry = expiry or self.nearest_expiry(asset_symbol)
+        expiry = expiry or self.nearest_expiry(asset_symbol, allow_expiry_day=allow_expiry_day)
         if expiry is None:
             return None
 

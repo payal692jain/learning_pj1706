@@ -21,15 +21,28 @@ class TestDropExpiringToday:
     def test_drops_todays_date(self):
         today = date.today().isoformat()
         tomorrow = (date.today() + timedelta(days=1)).isoformat()
-        assert drop_expiring_today([today, tomorrow]) == [tomorrow]
+        assert drop_expiring_today([today, tomorrow], allow_expiry_day=False) == [tomorrow]
 
     def test_keeps_list_unchanged_when_today_absent(self):
         future = [(date.today() + timedelta(days=i)).isoformat() for i in (7, 14)]
-        assert drop_expiring_today(future) == future
+        assert drop_expiring_today(future, allow_expiry_day=False) == future
 
     def test_falls_back_to_original_if_only_today_present(self):
         today = date.today().isoformat()
-        assert drop_expiring_today([today]) == [today]
+        assert drop_expiring_today([today], allow_expiry_day=False) == [today]
+
+    def test_keeps_todays_date_when_expiry_day_allowed(self):
+        today = date.today().isoformat()
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        assert drop_expiring_today([today, tomorrow], allow_expiry_day=True) == [today, tomorrow]
+
+    def test_reads_setting_when_flag_not_passed(self, monkeypatch):
+        today = date.today().isoformat()
+        tomorrow = (date.today() + timedelta(days=1)).isoformat()
+        monkeypatch.setenv("ALLOW_EXPIRY_DAY_OPTIONS", "true")
+        assert drop_expiring_today([today, tomorrow]) == [today, tomorrow]
+        monkeypatch.setenv("ALLOW_EXPIRY_DAY_OPTIONS", "false")
+        assert drop_expiring_today([today, tomorrow]) == [tomorrow]
 
 
 class TestGetExpiries:
@@ -49,7 +62,8 @@ class TestGetExpiries:
             expiries = client.get_expiries("NIFTY")
         assert expiries == [near, far]
 
-    def test_drops_expiry_dated_today(self, client):
+    def test_drops_expiry_dated_today(self, client, monkeypatch):
+        monkeypatch.setenv("ALLOW_EXPIRY_DAY_OPTIONS", "false")
         today = date.today().isoformat()
         future = (date.today() + timedelta(days=7)).isoformat()
         mock_resp = MagicMock()

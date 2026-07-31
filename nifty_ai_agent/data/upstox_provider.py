@@ -15,6 +15,8 @@ from urllib.parse import quote as urlquote
 import pandas as pd
 import requests
 
+from nifty_ai_agent.config import get_settings
+
 logger = logging.getLogger(__name__)
 
 _UPSTOX_BASE = "https://api.upstox.com/v2"
@@ -36,14 +38,24 @@ _RESAMPLE_FREQ = {
 }
 
 
-def drop_expiring_today(expiries_iso: list[str]) -> list[str]:
+def drop_expiring_today(
+    expiries_iso: list[str], allow_expiry_day: bool | None = None
+) -> list[str]:
     """Drop any expiry dated today from a sorted 'YYYY-MM-DD' list.
 
     An option expiring within hours has no meaningful time left to trade, so
     the "weekly" pick should roll forward to the next available expiry
     instead of the one about to go worthless. Falls back to the original
     list if that would leave nothing (e.g. Upstox only returned today).
+
+    Set ALLOW_EXPIRY_DAY_OPTIONS=true to keep today's expiry instead;
+    *allow_expiry_day* overrides that setting when passed explicitly.
     """
+    if allow_expiry_day is None:
+        allow_expiry_day = get_settings().allow_expiry_day_options
+    if allow_expiry_day:
+        return expiries_iso
+
     today_iso = date.today().isoformat()
     filtered = [d for d in expiries_iso if d != today_iso]
     return filtered if filtered else expiries_iso
@@ -238,25 +250,7 @@ class UpstoxClient:
         Daily bars ("1d") use Upstox's native "day" interval directly instead.
         """
         instrument_key = self._require_instrument_key(index_name)
-        today = date.today()
-        from_date = today - timedelta(days=days)
-
-        if interval in ("1d", "day"):
-            candles = self._fetch_candles(instrument_key, "day", from_date, today)
-            df = self._candles_to_df(candles)
-        else:
-            freq = _RESAMPLE_FREQ.get(interval, "5min")
-            historical = self._fetch_candles(
-                instrument_key, "1minute", from_date, today - timedelta(days=1)
-            )
-            intraday = self._fetch_intraday_candles(instrument_key, "1minute")
-            df = self._candles_to_df(historical + intraday)
-            if not df.empty:
-                df = df.resample(freq).agg({
-                    "open": "first", "high": "max", "low": "min",
-                    "close": "last", "volume": "sum",
-                }).dropna(subset=["open"])
-
+        df = self._historical_ohlcv(instrument_key, days, interval)
         if df.empty:
             raise ValueError(f"Upstox returned no historical candles for {index_name}")
 
@@ -264,6 +258,46 @@ class UpstoxClient:
             "Upstox historical OHLCV: %s interval=%s (%d bars)",
             index_name, interval, len(df),
         )
+        return df
+
+    def get_historical_ohlcv_by_key(
+        self, instrument_key: str, days: int, interval: str = "5m"
+    ) -> pd.DataFrame:
+        """Same as get_historical_ohlcv() but for an arbitrary instrument key.
+
+        Index chains use three known constant keys, but stocks are keyed by their
+        (ISIN-derived) equity key resolved via the instrument master — this lets the
+        stock scanner pull cash-market OHLCV from Upstox instead of yfinance.
+        """
+        if not self._access_token:
+            raise UpstoxAuthError("UPSTOX_ACCESS_TOKEN is not set")
+        df = self._historical_ohlcv(instrument_key, days, interval)
+        if df.empty:
+            raise ValueError(f"Upstox returned no historical candles for {instrument_key}")
+        return df
+
+    def _historical_ohlcv(self, instrument_key: str, days: int, interval: str) -> pd.DataFrame:
+        """Fetch + resample candles for *instrument_key* — the shared engine behind
+        both the index and by-key historical fetches. Returns an empty frame (rather
+        than raising) when Upstox has no candles, so callers phrase their own error."""
+        today = date.today()
+        from_date = today - timedelta(days=days)
+
+        if interval in ("1d", "day"):
+            candles = self._fetch_candles(instrument_key, "day", from_date, today)
+            return self._candles_to_df(candles)
+
+        freq = _RESAMPLE_FREQ.get(interval, "5min")
+        historical = self._fetch_candles(
+            instrument_key, "1minute", from_date, today - timedelta(days=1)
+        )
+        intraday = self._fetch_intraday_candles(instrument_key, "1minute")
+        df = self._candles_to_df(historical + intraday)
+        if not df.empty:
+            df = df.resample(freq).agg({
+                "open": "first", "high": "max", "low": "min",
+                "close": "last", "volume": "sum",
+            }).dropna(subset=["open"])
         return df
 
     def _fetch_candles(

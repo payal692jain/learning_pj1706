@@ -102,11 +102,16 @@ class Consensus:
         return [v for v in self.votes if v.signal == opposite]
 
 
-def effective_weight(strategy: str, now: dt_time) -> float:
-    """Base weight for *strategy*, adjusted for what time of day it is."""
+def effective_weight(strategy: str, now: dt_time, intraday: bool = True) -> float:
+    """Base weight for *strategy*, adjusted for what time of day it is.
+
+    The time-of-day decay only makes sense for an intraday option, where a stale
+    opening range genuinely stops mattering by the afternoon. For a monthly
+    horizon (intraday=False) the base weight stands regardless of the clock.
+    """
     weight = _BASE_WEIGHTS.get(strategy, _DEFAULT_WEIGHT)
 
-    if strategy == "Opening_Range_Breakout":
+    if intraday and strategy == "Opening_Range_Breakout":
         if now >= _ORB_STALE_START:
             weight *= _ORB_STALE_MULTIPLIER
         elif now >= _ORB_PRIME_END:
@@ -115,14 +120,22 @@ def effective_weight(strategy: str, now: dt_time) -> float:
     return round(weight, 3)
 
 
-def build_consensus(signals: list[Signal], now: dt_time) -> Consensus:
-    """Fold every strategy's Signal into one verdict as of *now* (IST wall clock)."""
+def build_consensus(
+    signals: list[Signal], now: dt_time, intraday: bool = True
+) -> Consensus:
+    """Fold every strategy's Signal into one verdict as of *now* (IST wall clock).
+
+    *intraday* (default True) applies the two rules that only hold for a same-day
+    option: the time-of-day strategy weighting and the late-session entry cutoff.
+    Set it False for a longer-horizon read (e.g. the monthly stock scan), where an
+    afternoon signal is not disqualified by theta the way a weekly-index one is.
+    """
     votes = [
         StrategyVote(
             strategy=s.strategy,
             signal=s.signal,
             confidence=s.confidence,
-            weight=effective_weight(s.strategy, now),
+            weight=effective_weight(s.strategy, now, intraday=intraday),
             reason=s.reason,
         )
         for s in signals
@@ -140,8 +153,9 @@ def build_consensus(signals: list[Signal], now: dt_time) -> Consensus:
     hold = sum(v.score for v in votes if v.signal == SignalType.HOLD)
     total = bullish + bearish + hold
 
-    # Too late in the session to open an intraday option position.
-    if now >= _ENTRY_CUTOFF:
+    # Too late in the session to open an intraday option position. A monthly
+    # position has weeks of life left, so the cutoff does not apply to it.
+    if intraday and now >= _ENTRY_CUTOFF:
         return Consensus(
             signal=SignalType.HOLD, confidence=0, agreement=0.0, conviction="NO_TRADE",
             votes=votes, bullish_weight=bullish, bearish_weight=bearish, hold_weight=hold,

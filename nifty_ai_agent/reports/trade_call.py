@@ -117,21 +117,30 @@ def _contract_lines(
         return lines
 
     iv = atm_iv(analysis, opt_type)
+    # The option chain is cached for up to 15 min, so analysis.spot (and the ATM
+    # premium read from it) can lag the live index that risk.entry_price was
+    # computed from this cycle. Reprice the entry premium onto the live spot so the
+    # "Buy ₹" trigger matches the index entry shown beneath it — otherwise a market
+    # that moved since the last chain refresh makes the two inconsistent. On a fresh
+    # cache this is a no-op, since analysis.spot == risk.entry_price.
+    live_entry = estimate_premium_at_spot(
+        entry, analysis.spot, risk.entry_price, analysis.atm_strike, analysis.expiry, iv, opt_type,
+    )
     target_premium = estimate_premium_at_spot(
-        entry, analysis.spot, risk.target, analysis.atm_strike, analysis.expiry, iv, opt_type,
+        live_entry, risk.entry_price, risk.target, analysis.atm_strike, analysis.expiry, iv, opt_type,
     )
     sl_premium = estimate_premium_at_spot(
-        entry, analysis.spot, risk.stop_loss, analysis.atm_strike, analysis.expiry, iv, opt_type,
+        live_entry, risk.entry_price, risk.stop_loss, analysis.atm_strike, analysis.expiry, iv, opt_type,
     )
-    loss_per_lot = max(0.0, entry - sl_premium) * lot_size
+    loss_per_lot = max(0.0, live_entry - sl_premium) * lot_size
 
     sizing = margin.size(
-        option_buy_margin(index_name, analysis.atm_strike, opt_type, entry, lot_size, analysis.spot),
+        option_buy_margin(index_name, analysis.atm_strike, opt_type, live_entry, lot_size, risk.entry_price),
         loss_per_lot_at_sl=loss_per_lot,
     )
 
     lines += [
-        f"Buy ₹{premium(entry)} → Sell ₹{premium(target_premium)} "
+        f"Buy ₹{premium(live_entry)} → Sell ₹{premium(target_premium)} "
         f"| Exit ₹{premium(sl_premium)}",
         f"Index {risk.entry_price:,.0f} → {risk.target:,.0f} | SL {risk.stop_loss:,.0f} "
         f"(RR 1:{risk.risk_reward_ratio})",
