@@ -60,6 +60,28 @@ estimated premiums until refreshed. For an unattended deployment use the **~1-ye
 Analytics Access Token** instead (see the main README's Upstox section) so there's
 nothing to refresh. The built-in token-health check alerts you if it ever goes stale.
 
+## Auto-deploy on git push (GitHub Actions)
+`.github/workflows/deploy.yml` runs the test suite on every push to `main`, then —
+only if it passes — SSHes to your VPS and redeploys. One-time setup:
+
+1. **On the VPS**, clone the repo once and create `.env` (as above). The workflow
+   only ever *updates* an existing checkout.
+2. **Generate a dedicated deploy key** (on your laptop):
+   ```bash
+   ssh-keygen -t ed25519 -f deploy_key -N ""
+   ```
+   Append `deploy_key.pub` to the VPS's `~/.ssh/authorized_keys`.
+3. **Add repository secrets** on GitHub (Settings → Secrets and variables → Actions):
+   - `VPS_HOST` — server IP/hostname
+   - `VPS_USER` — SSH user
+   - `VPS_SSH_KEY` — the **private** `deploy_key` contents
+   - `VPS_APP_DIR` — path to the repo on the server (e.g. `/home/deploy/market_analysyis`)
+   - (non-standard SSH port? add `VPS_PORT` and wire it in the workflow's `with:`)
+
+Now `git push` → tests run → on green, the VPS pulls and rebuilds automatically.
+Your `.env` on the server is never touched (it's untracked, so `git reset` leaves
+it alone). Pull requests run the tests but do **not** deploy.
+
 ## Optional: the dashboard
 The image runs the agent (`python main.py`). To also expose the Streamlit dashboard,
 add a second service that runs `streamlit run dashboard/app.py --server.port 8501`

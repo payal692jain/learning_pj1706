@@ -1,0 +1,57 @@
+# CI + auto-deploy.
+#
+# On every push to main: run the test suite, and only if it passes, SSH to the
+# VPS and redeploy (git pull + docker compose up --build). Pull requests run the
+# tests but never deploy.
+#
+# Required repository secrets (Settings → Secrets and variables → Actions):
+#   VPS_HOST     — server IP or hostname
+#   VPS_USER     — SSH user (e.g. deploy)
+#   VPS_SSH_KEY  — the PRIVATE key whose public half is in the server's
+#                  ~/.ssh/authorized_keys (generate a dedicated deploy key)
+#   VPS_APP_DIR  — path to the cloned repo on the server (e.g. /home/deploy/market_analysyis)
+# Non-standard SSH port? Add `port: ${{ secrets.VPS_PORT }}` under `with:` below.
+
+name: CI + Deploy
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch: {}
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+      - run: pip install -r requirements.txt
+      - run: python -m pytest -q
+
+  deploy:
+    needs: test
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    concurrency:
+      group: deploy-production
+      cancel-in-progress: false
+    steps:
+      # Pin to a commit SHA instead of @v1 for supply-chain hardening if you like.
+      - name: Deploy over SSH
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.VPS_HOST }}
+          username: ${{ secrets.VPS_USER }}
+          key: ${{ secrets.VPS_SSH_KEY }}
+          script_stop: true
+          script: |
+            cd ${{ secrets.VPS_APP_DIR }}
+            git fetch --all
+            git reset --hard origin/main
+            docker compose up -d --build
+            docker image prune -f
