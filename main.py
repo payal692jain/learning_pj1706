@@ -23,6 +23,7 @@ Dashboard (separate terminal):
 import ctypes
 import dataclasses
 import logging
+import sys
 import threading
 import time
 from typing import Callable, NamedTuple
@@ -955,12 +956,21 @@ _ES_SYSTEM_REQUIRED = 0x00000001
 
 
 def _prevent_sleep() -> None:
-    """Tell Windows not to sleep while the agent is running."""
+    """Tell Windows not to sleep while the agent is running (no-op off Windows).
+
+    Only Windows has this power-management API; in a Linux container (deployment)
+    there is nothing to keep awake, so the call is skipped rather than crashing on
+    the absent ctypes.windll.
+    """
+    if sys.platform != "win32":
+        return
     ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS | _ES_SYSTEM_REQUIRED)
 
 
 def _allow_sleep() -> None:
-    """Restore normal sleep behaviour when the agent exits."""
+    """Restore normal sleep behaviour when the agent exits (no-op off Windows)."""
+    if sys.platform != "win32":
+        return
     ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
 
 

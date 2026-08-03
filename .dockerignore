@@ -1,0 +1,21 @@
+# Keep the build context lean and — critically — keep secrets and local state
+# OUT of the image. .env is provided at runtime via docker-compose env_file, so
+# it must never be COPYed into an image layer.
+.env
+.git
+.gitignore
+.venv
+venv
+__pycache__
+*.pyc
+*.pyo
+.pytest_cache
+.coverage
+htmlcov
+.idea
+.vscode
+*.db
+*.sqlite3
+nifty_ai_agent/logs/*.log
+nifty_ai_agent/cache/*
+tests

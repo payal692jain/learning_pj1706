@@ -1,0 +1,40 @@
+# NIFTY AI Agent — 24/7 deployment: the agent + a Postgres database.
+#
+#   docker compose up -d --build      # start (first run builds the image)
+#   docker compose logs -f agent      # follow the agent's logs
+#   docker compose down               # stop (Postgres data persists in the volume)
+#
+# All secrets come from .env (Pushover / Telegram / Upstox / Anthropic keys).
+# DATABASE_URL is set here to override whatever is in .env so the agent always
+# talks to the Postgres service below, not a local SQLite file.
+
+services:
+  db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: nifty
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-changeme}
+      POSTGRES_DB: nifty
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U nifty -d nifty"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  agent:
+    build: .
+    env_file: .env
+    environment:
+      # Overrides .env — points the agent at the db service above.
+      DATABASE_URL: postgresql+psycopg://nifty:${POSTGRES_PASSWORD:-changeme}@db:5432/nifty
+      TZ: Asia/Kolkata
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: unless-stopped
+
+volumes:
+  pgdata:
