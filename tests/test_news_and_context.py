@@ -38,6 +38,19 @@ class TestStripHtml:
     def test_empty(self):
         assert _strip_html("") == ""
 
+    def test_decodes_wellformed_entities(self):
+        assert _strip_html("RBI&#39;s policy &amp; the &quot;market&quot;") == 'RBI\'s policy & the "market"'
+
+    def test_repairs_malformed_numeric_entity_missing_ampersand(self):
+        # Moneycontrol's feed drops the leading '&', e.g. "day#39;s".
+        assert _strip_html("hold on to day#39;s gains") == "hold on to day's gains"
+
+    def test_decodes_hex_entity(self):
+        assert _strip_html("Nifty tops 24#x2c;500") == "Nifty tops 24,500"
+
+    def test_out_of_range_code_point_left_untouched(self):
+        assert _strip_html("weird #999999999999;") == "weird #999999999999;"
+
 
 class TestFetchNews:
     def _make_feed(self, titles):

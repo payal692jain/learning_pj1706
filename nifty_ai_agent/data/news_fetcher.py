@@ -1,6 +1,8 @@
 """News fetcher — Indian and global market headlines via RSS feeds."""
 
+import html
 import logging
+import re
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -42,10 +44,9 @@ def fetch_news(max_items_per_feed: int = _MAX_ITEMS) -> list[NewsItem]:
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries[:max_items_per_feed]:
-                title = entry.get("title", "").strip()
-                summary = entry.get("summary", "").strip()
-                # strip HTML tags from summary
-                summary = _strip_html(summary)[:200]
+                title = _strip_html(entry.get("title", ""))
+                # strip HTML tags + decode entities from summary
+                summary = _strip_html(entry.get("summary", ""))[:200]
                 published = entry.get("published", "")
                 if title:
                     results.append(
@@ -78,7 +79,29 @@ def format_news_for_notification(items: list[NewsItem], limit: int = 5) -> str:
     return "\n".join(lines)
 
 
+_TAG_RE = re.compile(r"<[^>]+>")
+# Numeric HTML entities — with OR without the leading '&'. Some feeds (Moneycontrol)
+# emit them with the ampersand dropped, e.g. "day#39;s", which html.unescape can't
+# repair on its own because there is no '&' to anchor.
+_NUM_ENTITY_RE = re.compile(r"&?#(\d+);")
+_HEX_ENTITY_RE = re.compile(r"&?#[xX]([0-9a-fA-F]+);")
+
+
+def _num_to_char(match: re.Match, base: int) -> str:
+    try:
+        return chr(int(match.group(1), base))
+    except (ValueError, OverflowError):
+        return match.group(0)  # leave an out-of-range code point untouched
+
+
 def _strip_html(text: str) -> str:
-    """Minimal HTML tag stripper — avoids adding BeautifulSoup dependency."""
-    import re
-    return re.sub(r"<[^>]+>", "", text).strip()
+    """Strip HTML tags and decode HTML entities.
+
+    Handles the malformed numeric entities some RSS feeds emit without the leading
+    '&' (Moneycontrol's "day#39;s" → "day's"), then html.unescape() covers the
+    well-formed named/numeric ones (&amp;, &quot;, &#39;, …).
+    """
+    text = _TAG_RE.sub("", text)
+    text = _NUM_ENTITY_RE.sub(lambda m: _num_to_char(m, 10), text)
+    text = _HEX_ENTITY_RE.sub(lambda m: _num_to_char(m, 16), text)
+    return html.unescape(text).strip()
