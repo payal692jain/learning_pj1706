@@ -47,6 +47,7 @@ def run_morning_report(settings: Settings) -> None:
     notifier = PushoverNotifier(
         user_key=settings.pushover_user_key,
         api_token=settings.pushover_api_token,
+        enabled=settings.pushover_enabled,
     )
 
     # ── 1. Global markets + GIFT Nifty ─────────────────────────────────────────

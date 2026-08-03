@@ -89,6 +89,19 @@ class TestPushoverNotifier:
             result = notifier.send_text("Test", "Hello from tests")
         assert result is True
 
+    def test_disabled_notifier_is_a_no_op(self):
+        """enabled=False must never hit the network — the send is skipped, not retried."""
+        disabled = PushoverNotifier("k", "t", enabled=False)
+        with patch("requests.post") as post:
+            assert disabled.send_text("T", "should not send") is False
+        post.assert_not_called()
+
+    def test_missing_keys_skip_send(self):
+        no_keys = PushoverNotifier("", "", enabled=True)
+        with patch("requests.post") as post:
+            assert no_keys.send_text("T", "no keys") is False
+        post.assert_not_called()
+
     def test_retry_on_failure_then_success(self, notifier):
         fail = MagicMock()
         fail.raise_for_status.side_effect = requests.RequestException("error")

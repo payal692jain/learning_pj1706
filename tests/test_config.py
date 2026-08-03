@@ -49,8 +49,11 @@ class TestSettings:
             assert s.historical_days == 90
             assert s.log_level == "DEBUG"
 
-    def test_missing_required_field_raises(self):
-        # Clear env AND bypass .env file so required fields are truly absent
+    def test_loads_with_defaults_when_env_absent(self):
+        # Pushover keys are optional (Telegram-only deploys are supported), so with
+        # no env and no .env the settings still load — nothing is required.
         with patch.dict(os.environ, {}, clear=True):
-            with pytest.raises(Exception):
-                Settings(_env_file=None)
+            s = Settings(_env_file=None)
+        assert s.pushover_user_key == ""
+        assert s.pushover_api_token == ""
+        assert s.pushover_enabled is True

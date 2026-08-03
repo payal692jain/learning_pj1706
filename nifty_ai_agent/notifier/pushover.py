@@ -89,9 +89,10 @@ _PRIORITY_LOW = -1    # no sound/vibration
 class PushoverNotifier:
     """Send Pushover push notifications to your iPhone lock screen."""
 
-    def __init__(self, user_key: str, api_token: str) -> None:
+    def __init__(self, user_key: str, api_token: str, enabled: bool = True) -> None:
         self._user_key = user_key
         self._api_token = api_token
+        self._enabled = enabled
 
     def send_signal(
         self,
@@ -157,6 +158,15 @@ class PushoverNotifier:
         sound: str = "",
         monospace: bool = False,
     ) -> bool:
+        # Gate every send in one place: a disabled channel or missing keys is a
+        # silent no-op, so callers need not guard each notification themselves.
+        if not self._enabled:
+            logger.debug("Pushover disabled — skipping notification")
+            return False
+        if not (self._user_key and self._api_token):
+            logger.debug("Pushover keys not set — skipping notification")
+            return False
+
         payload: dict = {
             "token": self._api_token,
             "user": self._user_key,

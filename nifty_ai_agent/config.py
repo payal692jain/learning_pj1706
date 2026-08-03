@@ -18,8 +18,15 @@ class Settings(BaseSettings):
     claude_model: str = Field(default="claude-opus-4-8", description="Claude model ID")
 
     # ── Pushover ───────────────────────────────────────────────
-    pushover_user_key: str = Field(..., description="Pushover user key")
-    pushover_api_token: str = Field(..., description="Pushover application API token")
+    pushover_enabled: bool = Field(
+        default=True,
+        description=(
+            "Send notifications to Pushover. Set false to deliver via Telegram only "
+            "(e.g. once the Telegram bot is your delivery channel)."
+        ),
+    )
+    pushover_user_key: str = Field(default="", description="Pushover user key (optional if disabled)")
+    pushover_api_token: str = Field(default="", description="Pushover application API token (optional if disabled)")
 
     # ── Telegram broadcast bot (multi-user delivery) ───────────
     telegram_bot_token: str = Field(

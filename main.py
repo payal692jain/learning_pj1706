@@ -551,6 +551,7 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
         ).send_text(
             title=title,
             message=body,
@@ -606,6 +607,7 @@ def _run_next_session_outlook() -> None:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
         ).send_text(title=title, message=body, monospace=True)
         logger.info(
             "Next-session outlook sent: %s %+.0f pts (%s, n=%d)",
@@ -728,6 +730,7 @@ def _run_trade_plan() -> None:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
         ).send_text(title=title, message=body, monospace=True)
         logger.info("Trade plan sent (%d ideas, %d holds)", len(ideas), len(holds))
     except Exception as exc:
@@ -810,6 +813,7 @@ def _run_stock_scan() -> None:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
         ).send_text(title=title, message=body, priority=priority, monospace=True)
         logger.info(
             "Stock scan sent: %d ideas (%d actionable, %d errors)",
@@ -868,6 +872,7 @@ def _run_volatility_scan() -> None:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
         ).send_text(title=title, message=body, priority=priority, monospace=True)
         logger.info(
             "Volatility scan sent: %d straddles (%d ranked, %d errors)",
@@ -985,6 +990,7 @@ def main() -> None:
         notifier=PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
         )
     )
 
@@ -1045,6 +1051,7 @@ def main() -> None:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
             api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
         ).send_text(
             title="Market Agent Started",
             message=(
