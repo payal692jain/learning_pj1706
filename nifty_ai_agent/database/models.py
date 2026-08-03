@@ -2,7 +2,7 @@
 
 from datetime import datetime
 
-from sqlalchemy import DateTime, Float, Integer, String, Text
+from sqlalchemy import BigInteger, Boolean, DateTime, Float, Integer, String, Text
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column
 
 
@@ -38,6 +38,25 @@ class SignalRecord(Base):
     target: Mapped[float] = mapped_column(Float, nullable=True)
     risk_reward: Mapped[float] = mapped_column(Float, nullable=True)
     status: Mapped[str] = mapped_column(String(20), nullable=False, default="OPEN")
+
+
+class Subscriber(Base):
+    """A Telegram user who receives broadcast signals.
+
+    chat_id is a BigInteger because Telegram group/channel ids exceed 32 bits.
+    Only per-user knobs live here (capital, risk %) — the signals themselves are
+    global, computed once and fanned out to every active subscriber.
+    """
+
+    __tablename__ = "subscribers"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    chat_id: Mapped[int] = mapped_column(BigInteger, nullable=False, unique=True, index=True)
+    username: Mapped[str] = mapped_column(String(64), nullable=True)
+    capital: Mapped[float] = mapped_column(Float, nullable=False, default=50000.0)
+    risk_pct: Mapped[float] = mapped_column(Float, nullable=False, default=1.0)
+    active: Mapped[bool] = mapped_column(Boolean, nullable=False, default=True)
+    subscribed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
 class TradeRecord(Base):

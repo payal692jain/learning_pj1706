@@ -21,6 +21,16 @@ class Settings(BaseSettings):
     pushover_user_key: str = Field(..., description="Pushover user key")
     pushover_api_token: str = Field(..., description="Pushover application API token")
 
+    # ── Telegram broadcast bot (multi-user delivery) ───────────
+    telegram_bot_token: str = Field(
+        default="",
+        description=(
+            "Telegram Bot API token from @BotFather. When set, the agent runs a "
+            "broadcast bot: users /start it to subscribe and every signal is fanned "
+            "out to all active subscribers. Leave blank to stay single-user (Pushover)."
+        ),
+    )
+
     # ── Database ───────────────────────────────────────────────
     database_url: str = Field(
         default="sqlite:///nifty_ai_agent.db",

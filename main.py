@@ -5,11 +5,13 @@ Scheduled jobs (all IST):
   08:00        — pre-market morning report (global cues, option chain, news)
   08:05, hourly — Upstox token health check
   every 5 min  — intraday signal pipeline → one consensus trade call per index
-  every 15 min — risk & margin report (sent whatever the signals say)
   every 30 min — capital-aware trade plan across all three indices
-  09:45, 14:00 — single-stock monthly-option scan across NIFTY 50 (configurable)
+  every 30 min — single-stock CE/PE scan + volatile-stock straddle scan (configurable)
   16:00        — EOD prediction for the next session
   17:00        — next-session outlook (GIFT Nifty Session 2 has opened; first overnight read)
+
+Notifications go to Pushover (single user) and, when TELEGRAM_BOT_TOKEN is set, are
+broadcast to every subscriber of the Telegram bot (multi-user delivery).
 
 Start:
     python main.py
@@ -21,6 +23,7 @@ Dashboard (separate terminal):
 import ctypes
 import dataclasses
 import logging
+import threading
 import time
 from typing import Callable, NamedTuple
 
@@ -559,6 +562,8 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
     except Exception as exc:
         logger.error("%s Pushover failed: %s", index.name, exc)
 
+    _broadcast_telegram(title, body)
+
 
 # ── Next-session outlook (GIFT Nifty) ─────────────────────────────────────────
 
@@ -727,6 +732,8 @@ def _run_trade_plan() -> None:
     except Exception as exc:
         logger.error("Trade plan Pushover failed: %s", exc)
 
+    _broadcast_telegram(title, body)
+
 
 # ── Stock option scan (NIFTY 50 constituents) ──────────────────────────────────
 
@@ -810,6 +817,10 @@ def _run_stock_scan() -> None:
     except Exception as exc:
         logger.error("Stock scan Pushover failed: %s", exc)
 
+    # Only broadcast an actual CE/PE digest to subscribers — skip empty scans.
+    if result.ideas:
+        _broadcast_telegram(title, body)
+
 
 # ── Volatile-stock straddle scan (long-volatility CE+PE ideas) ──────────────────
 
@@ -863,6 +874,78 @@ def _run_volatility_scan() -> None:
         )
     except Exception as exc:
         logger.error("Volatility scan Pushover failed: %s", exc)
+
+    # Only broadcast an actual straddle digest to subscribers — skip empty scans.
+    if result.ideas:
+        _broadcast_telegram(title, body)
+
+
+# ── Telegram broadcast bot (multi-user delivery) ────────────────────────────────
+
+def _broadcast_telegram(title: str, body: str, *, monospace: bool = True) -> None:
+    """Fan one (title, body) out to every active Telegram subscriber, if the bot is on.
+
+    An index signal is identical for every user, so it is built once (for Pushover)
+    and delivered to all subscribers here. Chats that have blocked the bot are pruned
+    so a dead subscriber is not retried every cycle.
+    """
+    settings = get_settings()
+    if not settings.telegram_bot_token:
+        return
+    from nifty_ai_agent.notifier.telegram import TelegramNotifier, broadcast
+
+    repo = DatabaseRepository(settings.database_url)
+    chat_ids = [s.chat_id for s in repo.list_active_subscribers()]
+    if not chat_ids:
+        return
+
+    text = f"{title}\n{body}" if title else body
+    try:
+        delivered, blocked = broadcast(
+            TelegramNotifier(settings.telegram_bot_token), chat_ids, text, monospace=monospace,
+        )
+        for chat_id in blocked:
+            repo.deactivate_subscriber(chat_id)
+        logger.info("Telegram broadcast: %d delivered, %d pruned", delivered, len(blocked))
+    except Exception as exc:
+        logger.error("Telegram broadcast failed: %s", exc)
+
+
+def _run_telegram_bot() -> None:
+    """Long-poll Telegram for commands and reply — runs forever in a daemon thread.
+
+    The loop never dies on error: a failed poll sleeps briefly and retries, so a
+    transient network blip cannot take the subscribe/unsubscribe surface offline.
+    """
+    settings = get_settings()
+    token = settings.telegram_bot_token
+    if not token:
+        return
+    from nifty_ai_agent.notifier.telegram import TelegramNotifier, TelegramBlockedError
+    from nifty_ai_agent.notifier.telegram_commands import handle_update
+
+    notifier = TelegramNotifier(token)
+    repo = DatabaseRepository(settings.database_url)
+    offset: int | None = None
+    logger.info("Telegram bot polling started")
+
+    while True:
+        try:
+            for update in notifier.get_updates(offset=offset, timeout=25):
+                offset = update["update_id"] + 1
+                result = handle_update(update, repo)
+                if result is None:
+                    continue
+                chat_id, reply = result
+                try:
+                    notifier.send_message(chat_id, reply)
+                except TelegramBlockedError:
+                    repo.deactivate_subscriber(chat_id)
+                except Exception as exc:
+                    logger.warning("Telegram reply to %s failed: %s", chat_id, exc)
+        except Exception as exc:
+            logger.error("Telegram poll loop error: %s", exc)
+            time.sleep(5)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -963,6 +1046,14 @@ def main() -> None:
         )
     except Exception as exc:
         logger.warning("Startup ping failed: %s", exc)
+
+    # ── Telegram broadcast bot ────────────────────────────────────────────────────
+    # When a bot token is set, poll for /start-etc commands in a daemon thread so
+    # users can subscribe while the scheduler keeps running; signals fan out to all
+    # active subscribers from inside each _run_* via _broadcast_telegram().
+    if settings.telegram_bot_token:
+        threading.Thread(target=_run_telegram_bot, name="telegram-bot", daemon=True).start()
+        logger.info("Telegram broadcast bot enabled")
 
     # ── Schedule ────────────────────────────────────────────────────────────────
     # GIFT Nifty reads on the next session: 17:00 (Session 2 open, first overnight

@@ -7,7 +7,13 @@ import pandas as pd
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
-from nifty_ai_agent.database.models import Base, MarketDataRecord, SignalRecord, TradeRecord
+from nifty_ai_agent.database.models import (
+    Base,
+    MarketDataRecord,
+    SignalRecord,
+    Subscriber,
+    TradeRecord,
+)
 from nifty_ai_agent.risk.calculator import RiskParameters
 from nifty_ai_agent.strategies.base import Signal
 
@@ -129,3 +135,67 @@ class DatabaseRepository:
             record.exit_time = datetime.now(tz=timezone.utc)
             record.pnl = exit_price - record.entry_price
             session.commit()
+
+    # ── Telegram subscribers ─────────────────────────────────────────
+
+    def add_or_reactivate_subscriber(self, chat_id: int, username: str = "") -> None:
+        """Subscribe a chat, or re-activate one that had unsubscribed (idempotent)."""
+        with Session(self._engine) as session:
+            sub = session.scalars(
+                select(Subscriber).where(Subscriber.chat_id == chat_id)
+            ).first()
+            if sub is None:
+                sub = Subscriber(
+                    chat_id=chat_id,
+                    username=username or None,
+                    subscribed_at=datetime.now(tz=timezone.utc),
+                    active=True,
+                )
+                session.add(sub)
+            else:
+                sub.active = True
+                if username:
+                    sub.username = username
+            session.commit()
+        logger.info("Subscriber %s active", chat_id)
+
+    def deactivate_subscriber(self, chat_id: int) -> bool:
+        """Mark a subscriber inactive. Returns False if it was never subscribed."""
+        with Session(self._engine) as session:
+            sub = session.scalars(
+                select(Subscriber).where(Subscriber.chat_id == chat_id)
+            ).first()
+            if sub is None:
+                return False
+            sub.active = False
+            session.commit()
+            return True
+
+    def list_active_subscribers(self) -> list[Subscriber]:
+        with Session(self._engine) as session:
+            stmt = select(Subscriber).where(Subscriber.active.is_(True))
+            return list(session.scalars(stmt).all())
+
+    def get_subscriber(self, chat_id: int) -> Subscriber | None:
+        with Session(self._engine) as session:
+            return session.scalars(
+                select(Subscriber).where(Subscriber.chat_id == chat_id)
+            ).first()
+
+    def update_subscriber_capital(self, chat_id: int, capital: float) -> bool:
+        return self._update_subscriber(chat_id, capital=capital)
+
+    def update_subscriber_risk(self, chat_id: int, risk_pct: float) -> bool:
+        return self._update_subscriber(chat_id, risk_pct=risk_pct)
+
+    def _update_subscriber(self, chat_id: int, **fields) -> bool:
+        with Session(self._engine) as session:
+            sub = session.scalars(
+                select(Subscriber).where(Subscriber.chat_id == chat_id)
+            ).first()
+            if sub is None:
+                return False
+            for key, value in fields.items():
+                setattr(sub, key, value)
+            session.commit()
+            return True
