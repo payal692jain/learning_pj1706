@@ -2,8 +2,10 @@
 
 Scheduled jobs (all IST):
   06:45        — next-session outlook (GIFT Nifty Session 1 has opened; final pre-open read)
+  07:45        — overnight market analysis (global markets + GIFT implied open + news)
   08:00        — pre-market morning report (global cues, option chain, news)
   08:05, hourly — Upstox token health check
+  09:10        — pre-open trade plan (day's levels, all three indices, before the open)
   every 5 min  — intraday signal pipeline → one consensus trade call per index
   every 30 min — capital-aware trade plan across all three indices
   every 30 min — single-stock CE/PE scan + volatile-stock straddle scan (configurable)
@@ -117,6 +119,12 @@ def _is_market_hours() -> bool:
     open_time = now_ist.replace(hour=_MARKET_OPEN_HOUR, minute=15, second=0, microsecond=0)
     close_time = now_ist.replace(hour=_MARKET_CLOSE_HOUR, minute=_MARKET_CLOSE_MINUTE, second=0, microsecond=0)
     return open_time <= now_ist <= close_time
+
+
+def _is_trading_weekday() -> bool:
+    """True Mon–Fri (no holiday calendar). Used by the pre-open jobs that run
+    before market hours, where _is_market_hours() would always be False."""
+    return datetime.now(_IST).weekday() < 5
 
 
 # ── Option chain cache (per index) ──────────────────────────────────────────────
@@ -634,6 +642,64 @@ def _check_token() -> None:
     _token_monitor.check_and_alert(get_settings().upstox_access_token)
 
 
+def _run_overnight_analysis() -> None:
+    """Send the 07:45 overnight backdrop: global markets + GIFT implied open + news.
+
+    A single consolidated pre-open read (weekdays only), ahead of the fuller 08:00
+    morning report. Each piece is best-effort — the digest still goes out if news or
+    the implied-open calc is unavailable, as long as *some* data was gathered.
+    """
+    if not _is_trading_weekday():
+        logger.info("Overnight analysis: weekend — skipping.")
+        return
+
+    settings = get_settings()
+    from nifty_ai_agent.data.market_context import compute_global_bias, fetch_global_indices
+    from nifty_ai_agent.data.news_fetcher import fetch_news
+    from nifty_ai_agent.reports.overnight import format_overnight_analysis
+
+    indices = []
+    try:
+        indices = fetch_global_indices()
+    except Exception as exc:
+        logger.warning("Overnight analysis: global indices failed: %s", exc)
+    bias = compute_global_bias(indices)
+
+    # GIFT implied open + gap base rate (best-effort — needs GIFT + NIFTY daily bars).
+    outlook = stats = None
+    gift = fetch_gift_nifty()
+    if gift is not None:
+        try:
+            daily = NSEDataProvider(
+                symbol=settings.nifty_symbol,
+                upstox_access_token=settings.upstox_access_token,
+            ).get_historical_data(days=settings.gap_history_days, interval="1d")
+            clean = daily.dropna(subset=["open", "high", "low", "close"])
+            if not clean.empty:
+                outlook = build_outlook(gift, float(clean["close"].iloc[-1]))
+                stats = analyse_gap_history(clean, outlook.bucket)
+                if gift.change_pct > 0.5:
+                    bias = "BULLISH"
+                elif gift.change_pct < -0.5:
+                    bias = "BEARISH"
+        except Exception as exc:
+            logger.warning("Overnight analysis: implied-open calc failed: %s", exc)
+
+    news = []
+    try:
+        news = fetch_news()
+    except Exception as exc:
+        logger.warning("Overnight analysis: news failed: %s", exc)
+
+    if not indices and outlook is None:
+        logger.warning("Overnight analysis: no data gathered — skipping notification.")
+        return
+
+    title, body = format_overnight_analysis(indices, bias, outlook, stats, news)
+    _send_notification(settings, title, body)
+    logger.info("Overnight analysis sent (bias=%s, gift=%s)", bias, gift is not None)
+
+
 def _run_morning_report() -> None:
     """Wrapper for the 8 AM morning report job."""
     settings = get_settings()
@@ -708,9 +774,18 @@ def _build_index_trade_idea(index: IndexConfig, settings) -> TradeIdea | None:
     return build_trade_idea(index.name, best.signal, best.confidence, oc_weekly, risk)
 
 
-def _run_trade_plan() -> None:
-    """Send one capital-aware trade-plan notification covering all three indices."""
-    if not _is_market_hours():
+def _run_trade_plan(pre_open: bool = False) -> None:
+    """Send one capital-aware trade-plan notification covering all three indices.
+
+    *pre_open* runs the plan before the 09:15 open (the 09:10 job): it swaps the
+    market-hours guard for a weekday guard — the levels come from the prior session's
+    bars plus the live option chain — and labels the notification accordingly.
+    """
+    if pre_open:
+        if not _is_trading_weekday():
+            logger.info("Pre-open trade plan: weekend — skipping.")
+            return
+    elif not _is_market_hours():
         logger.info("Trade plan: outside market hours — skipping.")
         return
 
@@ -726,6 +801,8 @@ def _run_trade_plan() -> None:
         (ideas.append(idea) if idea else holds.append(index.name))
 
     title, body = format_trade_plan(ideas, holds)
+    if pre_open:
+        title = f"🌅 Pre-Open · {title}"
     try:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
@@ -917,6 +994,21 @@ def _broadcast_telegram(title: str, body: str, *, monospace: bool = True) -> Non
         logger.error("Telegram broadcast failed: %s", exc)
 
 
+def _send_notification(settings, title: str, body: str, *, monospace: bool = True) -> None:
+    """Deliver one (title, body) to both channels — Pushover (if enabled) and every
+    Telegram subscriber. The single place new digests route through so they reach
+    whichever channels are configured without repeating the boilerplate."""
+    try:
+        PushoverNotifier(
+            user_key=settings.pushover_user_key,
+            api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
+        ).send_text(title=title, message=body, monospace=monospace)
+    except Exception as exc:
+        logger.error("Pushover send failed: %s", exc)
+    _broadcast_telegram(title, body, monospace=monospace)
+
+
 def _run_telegram_bot() -> None:
     """Long-poll Telegram for commands and reply — runs forever in a daemon thread.
 
@@ -1077,7 +1169,10 @@ def main() -> None:
     # read) and 06:45 (Session 1 open, final pre-open read before 09:15).
     schedule.every().day.at("06:45").do(_run_next_session_outlook)
     schedule.every().day.at("17:00").do(_run_next_session_outlook)
+    schedule.every().day.at("07:45").do(_run_overnight_analysis)
     schedule.every().day.at("08:00").do(_run_morning_report)
+    # Pre-open trade plan — 5 min before the 09:15 open, so the day's levels are ready.
+    schedule.every().day.at("09:10").do(_run_trade_plan, pre_open=True)
     # Token health runs before the market opens (so a dead overnight token is caught
     # while there is still time to fix it) and hourly through the session.
     schedule.every().day.at("08:05").do(_check_token)

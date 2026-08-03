@@ -147,8 +147,10 @@ flowchart LR
     subgraph PRE["Pre-market & overnight"]
         direction TB
         A1["06:45 · GIFT Nifty next-session read"]
+        A5["07:45 · Overnight analysis (global + implied open + news)"]
         A2["08:00 · Morning brief (global, A/D, OC, news, Claude plan)"]
         A3["08:05 + hourly · Upstox token health"]
+        A6["09:10 · Pre-open trade plan (day's levels, all indices)"]
         A4["17:00 · GIFT Nifty overnight read"]
     end
     subgraph MKT["Market hours · 09:15–15:30"]
