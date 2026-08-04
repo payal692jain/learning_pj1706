@@ -92,7 +92,7 @@ class Settings(BaseSettings):
 
     # ── Notification filtering ─────────────────────────────────
     min_signal_confidence: int = Field(
-        default=70,
+        default=50,
         description=(
             "Only notify when a signal's confidence is at least this %. Gates the "
             "intraday trade call (including the EOD prediction), the trade plan, and "
