@@ -534,6 +534,21 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         except Exception as exc:
             logger.error("%s: failed to save %s signal: %s", index.name, signal.strategy, exc)
 
+    # ── Notify only high-conviction, actionable calls ─────────────────────────────
+    # Every strategy vote is already saved above; the notification itself is gated
+    # so a HOLD cycle or a sub-threshold BUY does not buzz anyone. The after-hours
+    # EOD prediction uses a lower floor — it is context for tomorrow, not a live entry.
+    notify_threshold = (
+        settings.min_prediction_confidence if after_hours else settings.min_signal_confidence
+    )
+    if not (consensus.is_actionable and consensus.confidence >= notify_threshold):
+        logger.info(
+            "%s: %s %d%% below %s threshold (%d%%) — recorded, not notified.",
+            index.name, consensus.signal.value, consensus.confidence,
+            "prediction" if after_hours else "signal", notify_threshold,
+        )
+        return
+
     # ── Pushover — the call, not the research dump ────────────────────────────────
     margin_calculator = MarginCalculator(
         capital=settings.trading_capital,
@@ -800,6 +815,14 @@ def _run_trade_plan(pre_open: bool = False) -> None:
             idea = None
         (ideas.append(idea) if idea else holds.append(index.name))
 
+    # Only high-conviction ideas make the plan; skip the whole notification if none.
+    ideas = [i for i in ideas if i.confidence >= settings.min_signal_confidence]
+    if not ideas:
+        logger.info(
+            "Trade plan: no idea >= %d%% — not notified.", settings.min_signal_confidence,
+        )
+        return
+
     title, body = format_trade_plan(ideas, holds)
     if pre_open:
         title = f"🌅 Pre-Open · {title}"
@@ -881,6 +904,9 @@ def _run_stock_scan() -> None:
         default_iv=settings.stock_default_iv,
         top_n=settings.stock_scan_top_n,
     )
+
+    # Keep only high-conviction ideas — the rest are dropped from the digest.
+    result.ideas = [i for i in result.ideas if i.confidence >= settings.min_signal_confidence]
 
     title, body = format_stock_scan(result)
     # Running every 30 min, a "no setups" digest should not buzz the phone — only an

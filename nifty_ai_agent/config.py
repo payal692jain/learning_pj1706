@@ -90,6 +90,24 @@ class Settings(BaseSettings):
         ),
     )
 
+    # ── Notification filtering ─────────────────────────────────
+    min_signal_confidence: int = Field(
+        default=70,
+        description=(
+            "Only notify on a LIVE signal when its confidence is at least this %. Gates "
+            "the intraday trade call, the trade plan, and the stock scan — lower-conviction "
+            "signals are still recorded, just not pushed. Set 0 to notify on everything."
+        ),
+    )
+    min_prediction_confidence: int = Field(
+        default=50,
+        description=(
+            "Confidence floor for the after-hours EOD prediction (the next-session "
+            "outlook). Lower than the live threshold because a prediction is context, "
+            "not a live entry — shown down to this %."
+        ),
+    )
+
     # ── Risk ───────────────────────────────────────────────────
     max_risk_per_trade_pct: float = Field(
         default=1.0, description="Maximum risk per trade as % of capital"
