@@ -536,16 +536,12 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
 
     # ── Notify only high-conviction, actionable calls ─────────────────────────────
     # Every strategy vote is already saved above; the notification itself is gated
-    # so a HOLD cycle or a sub-threshold BUY does not buzz anyone. The after-hours
-    # EOD prediction uses a lower floor — it is context for tomorrow, not a live entry.
-    notify_threshold = (
-        settings.min_prediction_confidence if after_hours else settings.min_signal_confidence
-    )
-    if not (consensus.is_actionable and consensus.confidence >= notify_threshold):
+    # so a HOLD cycle or a sub-threshold BUY does not buzz anyone.
+    if not (consensus.is_actionable and consensus.confidence >= settings.min_signal_confidence):
         logger.info(
-            "%s: %s %d%% below %s threshold (%d%%) — recorded, not notified.",
+            "%s: %s %d%% below notify threshold (%d%%) — recorded, not notified.",
             index.name, consensus.signal.value, consensus.confidence,
-            "prediction" if after_hours else "signal", notify_threshold,
+            settings.min_signal_confidence,
         )
         return
 
