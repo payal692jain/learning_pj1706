@@ -3,7 +3,7 @@
 from nifty_ai_agent.data.gift_nifty import GiftNiftyQuote, OpenOutlook
 from nifty_ai_agent.data.market_context import IndexSnapshot
 from nifty_ai_agent.data.news_fetcher import NewsItem
-from nifty_ai_agent.reports.overnight import format_overnight_analysis
+from nifty_ai_agent.reports.overnight import blend_market_mood, format_overnight_analysis
 from nifty_ai_agent.strategies.gap_analyser import GapStats
 from nifty_ai_agent.strategies.global_analyser import NewsSentiment
 
@@ -46,6 +46,25 @@ def _news() -> list[NewsItem]:
         NewsItem(title="RBI holds rates", source="ET", published="today"),
         NewsItem(title="US tech rallies", source="Reuters", published="today"),
     ]
+
+
+class TestBlendMarketMood:
+    _BULL = NewsSentiment(score=0.5, bullish_hits=3, bearish_hits=1, headlines=4)
+    _BEAR = NewsSentiment(score=-0.5, bullish_hits=1, bearish_hits=3, headlines=4)
+    _EMPTY = NewsSentiment(score=0.0, bullish_hits=0, bearish_hits=0, headlines=0)
+
+    def test_news_confirms_index_bias(self):
+        assert blend_market_mood("BULLISH", self._BULL, self._BULL) == "BULLISH"
+
+    def test_two_opposing_news_regions_neutralise_index_bias(self):
+        # index +2, two bearish regions -2 → net 0 → NEUTRAL
+        assert blend_market_mood("BULLISH", self._BEAR, self._BEAR) == "NEUTRAL"
+
+    def test_neutral_index_tilts_with_news(self):
+        assert blend_market_mood("NEUTRAL", self._BULL, self._EMPTY) == "BULLISH"
+
+    def test_empty_news_keeps_index_bias(self):
+        assert blend_market_mood("BEARISH", self._EMPTY, self._EMPTY) == "BEARISH"
 
 
 class TestFormatOvernightAnalysis:

@@ -96,6 +96,17 @@ class GlobalSnapshot:
         return "CALM"
 
 
+def split_sentiment(items: list[NewsItem]) -> tuple[NewsSentiment, NewsSentiment]:
+    """Score Indian and world headlines separately: returns *(india, world)*.
+
+    The single place the region split lives, so the overnight analysis and the
+    morning report score sentiment the same way.
+    """
+    india = analyse_news([n for n in items if getattr(n, "region", "IN") == "IN"])
+    world = analyse_news([n for n in items if getattr(n, "region", "IN") == "WORLD"])
+    return india, world
+
+
 def analyse_news(items: list[NewsItem]) -> NewsSentiment:
     """Score headlines by bullish/bearish keyword balance."""
     if not items:

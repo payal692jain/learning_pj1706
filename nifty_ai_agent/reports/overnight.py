@@ -15,6 +15,26 @@ from nifty_ai_agent.strategies.global_analyser import NewsSentiment
 
 _GAP_ICON = {"GAP_UP": "🟢", "GAP_DOWN": "🔴", "FLAT": "⚪"}
 _MOOD_ICON = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
+_MOOD_SCORE = {"BULLISH": 1, "BEARISH": -1, "NEUTRAL": 0}
+
+
+def blend_market_mood(
+    index_bias: str,
+    india_sentiment: NewsSentiment | None,
+    world_sentiment: NewsSentiment | None,
+) -> str:
+    """Fold the index/GIFT bias together with India + world news sentiment into one
+    market mood. The index/GIFT bias carries double weight — prices lead — while each
+    news region can confirm or tilt it."""
+    total = 2 * _MOOD_SCORE.get(index_bias, 0)
+    for sentiment in (india_sentiment, world_sentiment):
+        if sentiment is not None and sentiment.headlines:
+            total += _MOOD_SCORE.get(sentiment.label, 0)
+    if total > 0:
+        return "BULLISH"
+    if total < 0:
+        return "BEARISH"
+    return "NEUTRAL"
 
 
 def _pct(by: dict[str, IndexSnapshot], name: str) -> str:
@@ -48,7 +68,7 @@ def format_overnight_analysis(
         title = f"🌍 Overnight: {global_bias}"
 
     essential = [
-        f"Global bias: {global_bias}",
+        f"Market mood: {global_bias}",
         f"US    S&P {_pct(by, 'S&P 500')} · Dow {_pct(by, 'Dow Jones')} · Nasdaq {_pct(by, 'NASDAQ')}",
         f"Asia  Nikkei {_pct(by, 'Nikkei 225')} · HangSeng {_pct(by, 'Hang Seng')}",
         f"Euro  FTSE {_pct(by, 'FTSE 100')} · DAX {_pct(by, 'DAX')}",

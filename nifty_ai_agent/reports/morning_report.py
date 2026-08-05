@@ -122,15 +122,29 @@ def run_morning_report(settings: Settings) -> None:
     except Exception as exc:
         logger.error("Option chain analysis failed: %s", exc)
 
-    # ── 4. Top market news ──────────────────────────────────────────────────────
+    # ── 4. Top market news + India/world sentiment ──────────────────────────────
     news_items: list[NewsItem] = _safe_fetch("news", fetch_news) or []
     if news_items:
+        from nifty_ai_agent.strategies.global_analyser import split_sentiment
+
+        india, world = split_sentiment(news_items)
+        sentiment_lines = [
+            f"{label}: {s.label} ({s.bullish_hits}↑/{s.bearish_hits}↓)"
+            for label, s in (("India", india), ("World", world)) if s.headlines
+        ]
+        body = format_news_for_notification(news_items, limit=5)
+        if sentiment_lines:
+            body = "Sentiment — " + "  ·  ".join(sentiment_lines) + "\n\n" + body
+        moods = " / ".join(s.label for s in (india, world) if s.headlines)
         notifier.send_text(
-            title="📰 Market News",
-            message=format_news_for_notification(news_items, limit=5),
+            title=f"📰 Market News · {moods}" if moods else "📰 Market News",
+            message=body,
             priority=-1,
         )
-        logger.info("News sent: %d headlines", len(news_items))
+        logger.info(
+            "News sent: %d headlines (IN=%s, WORLD=%s)",
+            len(news_items), india.label, world.label,
+        )
 
     # ── 5. Claude AI daily trading plan ────────────────────────────────────────
     if settings.anthropic_api_key and ctx:
