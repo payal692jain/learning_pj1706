@@ -92,12 +92,12 @@ class Settings(BaseSettings):
 
     # ── Notification filtering ─────────────────────────────────
     min_signal_confidence: int = Field(
-        default=50,
+        default=0,
         description=(
             "Only notify when a signal's confidence is at least this %. Gates the "
             "intraday trade call (including the EOD prediction), the trade plan, and "
             "the stock scan — lower-conviction signals are still recorded, just not "
-            "pushed. Set 0 to notify on everything."
+            "pushed. 0 (default) notifies on every actionable signal, no filtering."
         ),
     )
 
