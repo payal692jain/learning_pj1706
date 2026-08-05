@@ -534,16 +534,18 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         except Exception as exc:
             logger.error("%s: failed to save %s signal: %s", index.name, signal.strategy, exc)
 
-    # ── Notify only high-conviction, actionable calls ─────────────────────────────
-    # Every strategy vote is already saved above; the notification itself is gated
-    # so a HOLD cycle or a sub-threshold BUY does not buzz anyone.
-    if not (consensus.is_actionable and consensus.confidence >= settings.min_signal_confidence):
+    # ── Notify every cycle; a HOLD is a silent heartbeat ──────────────────────────
+    # Every strategy vote is already saved above. A HOLD ("no trade right now") is
+    # still sent, but silently, so the loop is visibly alive without buzzing; an
+    # actionable BUY below the confidence threshold is dropped entirely.
+    if consensus.is_actionable and consensus.confidence < settings.min_signal_confidence:
         logger.info(
             "%s: %s %d%% below notify threshold (%d%%) — recorded, not notified.",
             index.name, consensus.signal.value, consensus.confidence,
             settings.min_signal_confidence,
         )
         return
+    silent = not consensus.is_actionable
 
     # ── Pushover — the call, not the research dump ────────────────────────────────
     margin_calculator = MarginCalculator(
@@ -574,16 +576,18 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         ).send_text(
             title=title,
             message=body,
+            priority=(-1 if silent else 0),
             monospace=True,
         )
         logger.info(
-            "%s trade call sent: %s %s (%d%%)",
+            "%s trade call sent: %s %s (%d%%)%s",
             index.name, consensus.conviction, consensus.signal.value, consensus.confidence,
+            " [silent]" if silent else "",
         )
     except Exception as exc:
         logger.error("%s Pushover failed: %s", index.name, exc)
 
-    _broadcast_telegram(title, body)
+    _broadcast_telegram(title, body, silent=silent)
 
 
 # ── Next-session outlook (GIFT Nifty) ─────────────────────────────────────────
@@ -987,12 +991,13 @@ def _run_volatility_scan() -> None:
 
 # ── Telegram broadcast bot (multi-user delivery) ────────────────────────────────
 
-def _broadcast_telegram(title: str, body: str, *, monospace: bool = True) -> None:
+def _broadcast_telegram(title: str, body: str, *, monospace: bool = True, silent: bool = False) -> None:
     """Fan one (title, body) out to every active Telegram subscriber, if the bot is on.
 
     An index signal is identical for every user, so it is built once (for Pushover)
     and delivered to all subscribers here. Chats that have blocked the bot are pruned
-    so a dead subscriber is not retried every cycle.
+    so a dead subscriber is not retried every cycle. *silent* delivers without a buzz
+    (the HOLD heartbeat).
     """
     settings = get_settings()
     if not settings.telegram_bot_token:
@@ -1007,7 +1012,8 @@ def _broadcast_telegram(title: str, body: str, *, monospace: bool = True) -> Non
     text = f"{title}\n{body}" if title else body
     try:
         delivered, blocked = broadcast(
-            TelegramNotifier(settings.telegram_bot_token), chat_ids, text, monospace=monospace,
+            TelegramNotifier(settings.telegram_bot_token), chat_ids, text,
+            monospace=monospace, silent=silent,
         )
         for chat_id in blocked:
             repo.deactivate_subscriber(chat_id)

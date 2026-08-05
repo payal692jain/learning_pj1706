@@ -64,6 +64,24 @@ class TestTelegramNotifier:
         assert captured["parse_mode"] == "HTML"
         assert captured["text"] == "<pre>a &lt; b &amp; c</pre>"
 
+    def test_silent_sets_disable_notification(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            tg.requests, "post",
+            lambda url, data, timeout: captured.update(data) or _Resp(ok=True),
+        )
+        TelegramNotifier("TOK").send_message(42, "heartbeat", silent=True)
+        assert captured.get("disable_notification") is True
+
+    def test_default_is_not_silent(self, monkeypatch):
+        captured = {}
+        monkeypatch.setattr(
+            tg.requests, "post",
+            lambda url, data, timeout: captured.update(data) or _Resp(ok=True),
+        )
+        TelegramNotifier("TOK").send_message(42, "buzz")
+        assert "disable_notification" not in captured
+
     def test_blocked_raises(self, monkeypatch):
         monkeypatch.setattr(tg.requests, "post", lambda *a, **k: _Resp(status_code=403))
         with pytest.raises(TelegramBlockedError):

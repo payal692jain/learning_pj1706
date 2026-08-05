@@ -39,13 +39,16 @@ class TelegramNotifier:
     def _url(self, method: str) -> str:
         return f"{_API_BASE}{self._token}/{method}"
 
-    def send_message(self, chat_id: int | str, text: str, *, monospace: bool = False) -> bool:
+    def send_message(
+        self, chat_id: int | str, text: str, *, monospace: bool = False, silent: bool = False,
+    ) -> bool:
         """Send *text* to one chat. Returns True on success, False on a soft failure.
 
         *monospace* wraps the body in an HTML <pre> block so the option tables stay
-        aligned, mirroring the Pushover monospace behaviour. Raises
-        TelegramBlockedError when the chat blocked the bot, so the broadcaster can
-        prune that subscriber.
+        aligned, mirroring the Pushover monospace behaviour. *silent* delivers without
+        a notification sound (a HOLD heartbeat lands in the chat without buzzing).
+        Raises TelegramBlockedError when the chat blocked the bot, so the broadcaster
+        can prune that subscriber.
         """
         if monospace:
             text = f"<pre>{_html_escape(text)}</pre>"
@@ -56,6 +59,8 @@ class TelegramNotifier:
         }
         if monospace:
             payload["parse_mode"] = "HTML"
+        if silent:
+            payload["disable_notification"] = True
 
         for attempt in range(1, _RETRY_COUNT + 1):
             try:
@@ -97,19 +102,21 @@ def broadcast(
     text: str,
     *,
     monospace: bool = True,
+    silent: bool = False,
 ) -> tuple[int, list[int]]:
     """Send *text* to every chat in *chat_ids*.
 
     Returns *(delivered, blocked)* — the count sent successfully and the chat ids
     that blocked the bot, so the caller can deactivate those subscribers. Fanning
     out one precomputed message is the whole point: an index signal is identical
-    for every user, so it is built once and delivered many times.
+    for every user, so it is built once and delivered many times. *silent* delivers
+    without a buzz (used for the HOLD heartbeat).
     """
     delivered = 0
     blocked: list[int] = []
     for cid in chat_ids:
         try:
-            if notifier.send_message(cid, text, monospace=monospace):
+            if notifier.send_message(cid, text, monospace=monospace, silent=silent):
                 delivered += 1
         except TelegramBlockedError:
             blocked.append(cid)
