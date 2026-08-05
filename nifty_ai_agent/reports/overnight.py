@@ -11,8 +11,10 @@ from nifty_ai_agent.data.market_context import IndexSnapshot
 from nifty_ai_agent.data.news_fetcher import NewsItem, format_news_for_notification
 from nifty_ai_agent.reports.layout import fit_sections
 from nifty_ai_agent.strategies.gap_analyser import GapStats
+from nifty_ai_agent.strategies.global_analyser import NewsSentiment
 
 _GAP_ICON = {"GAP_UP": "🟢", "GAP_DOWN": "🔴", "FLAT": "⚪"}
+_MOOD_ICON = {"BULLISH": "🟢", "BEARISH": "🔴", "NEUTRAL": "⚪"}
 
 
 def _pct(by: dict[str, IndexSnapshot], name: str) -> str:
@@ -26,12 +28,15 @@ def format_overnight_analysis(
     outlook: OpenOutlook | None,
     stats: GapStats | None,
     news: list[NewsItem],
+    india_sentiment: NewsSentiment | None = None,
+    world_sentiment: NewsSentiment | None = None,
 ) -> tuple[str, str]:
     """Return (title, body) for the overnight analysis notification.
 
     Indices are rendered grouped (US / Asia / Europe / VIX) to stay compact; the
-    implied-open block and news are added when available. Everything composes
-    through fit_sections so the body respects the Pushover length limit.
+    India/world news sentiment, implied-open block, and headlines are added when
+    available. Everything composes through fit_sections so the body respects the
+    Pushover length limit.
     """
     by = {s.name: s for s in indices}
 
@@ -51,6 +56,18 @@ def format_overnight_analysis(
     vix = by.get("India VIX")
     if vix is not None:
         essential.append(f"India VIX {vix.price:,.2f} ({vix.change_pct:+.2f}%)")
+
+    # News sentiment, India and world scored separately.
+    sentiment_lines = []
+    for region_label, sent in (("India", india_sentiment), ("World", world_sentiment)):
+        if sent is not None and sent.headlines:
+            icon = _MOOD_ICON.get(sent.label, "")
+            sentiment_lines.append(
+                f"{icon} {region_label} news: {sent.label} ({sent.bullish_hits}↑/{sent.bearish_hits}↓)"
+            )
+    if sentiment_lines:
+        essential.append("")
+        essential += sentiment_lines
 
     if outlook is not None:
         gift = outlook.gift

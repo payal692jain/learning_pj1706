@@ -15,12 +15,16 @@ logger = logging.getLogger(__name__)
 _TIMEOUT = 10
 _MAX_ITEMS = 5  # headlines per feed
 
-# ── RSS feed sources ───────────────────────────────────────────────────────────
-_FEEDS = {
-    "Economic Times Markets": "https://economictimes.indiatimes.com/markets/rss.cms",
-    "Moneycontrol Markets":   "https://www.moneycontrol.com/rss/marketreports.xml",
-    "Reuters Business":       "https://feeds.reuters.com/reuters/businessNews",
-    "Livemint Markets":       "https://www.livemint.com/rss/markets",
+# ── RSS feed sources ── (name → (url, region)) ──────────────────────────────────
+# region tags the headline as Indian ("IN") or global ("WORLD") market news so the
+# market analysis can score sentiment for each separately. Reuters' RSS was retired
+# (feeds.reuters.com now returns nothing), so CNBC + Investing.com carry world news.
+_FEEDS: dict[str, tuple[str, str]] = {
+    "Economic Times Markets": ("https://economictimes.indiatimes.com/markets/rss.cms", "IN"),
+    "Moneycontrol Markets":   ("https://www.moneycontrol.com/rss/marketreports.xml", "IN"),
+    "Livemint Markets":       ("https://www.livemint.com/rss/markets", "IN"),
+    "CNBC Markets":           ("https://www.cnbc.com/id/10000664/device/rss/rss.html", "WORLD"),
+    "Investing.com":          ("https://www.investing.com/rss/news_25.rss", "WORLD"),
 }
 
 
@@ -30,6 +34,7 @@ class NewsItem:
     source: str
     published: str
     summary: str = ""
+    region: str = "IN"          # "IN" (Indian market news) or "WORLD" (global)
 
 
 def fetch_news(max_items_per_feed: int = _MAX_ITEMS) -> list[NewsItem]:
@@ -40,7 +45,7 @@ def fetch_news(max_items_per_feed: int = _MAX_ITEMS) -> list[NewsItem]:
     """
     results: list[NewsItem] = []
 
-    for source, url in _FEEDS.items():
+    for source, (url, region) in _FEEDS.items():
         try:
             feed = feedparser.parse(url)
             for entry in feed.entries[:max_items_per_feed]:
@@ -50,7 +55,10 @@ def fetch_news(max_items_per_feed: int = _MAX_ITEMS) -> list[NewsItem]:
                 published = entry.get("published", "")
                 if title:
                     results.append(
-                        NewsItem(title=title, source=source, published=published, summary=summary)
+                        NewsItem(
+                            title=title, source=source, published=published,
+                            summary=summary, region=region,
+                        )
                     )
             logger.debug("Fetched %d items from %s", len(feed.entries[:max_items_per_feed]), source)
         except Exception as exc:

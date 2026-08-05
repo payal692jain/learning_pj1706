@@ -5,6 +5,7 @@ from nifty_ai_agent.data.market_context import IndexSnapshot
 from nifty_ai_agent.data.news_fetcher import NewsItem
 from nifty_ai_agent.reports.overnight import format_overnight_analysis
 from nifty_ai_agent.strategies.gap_analyser import GapStats
+from nifty_ai_agent.strategies.global_analyser import NewsSentiment
 
 
 def _indices() -> list[IndexSnapshot]:
@@ -49,15 +50,30 @@ def _news() -> list[NewsItem]:
 
 class TestFormatOvernightAnalysis:
     def test_full_digest_renders_all_sections(self):
-        title, body = format_overnight_analysis(_indices(), "BULLISH", _outlook(), _stats(), _news())
+        india = NewsSentiment(score=0.6, bullish_hits=5, bearish_hits=1, headlines=6)
+        world = NewsSentiment(score=-0.3, bullish_hits=1, bearish_hits=3, headlines=4)
+        title, body = format_overnight_analysis(
+            _indices(), "BULLISH", _outlook(), _stats(), _news(),
+            india_sentiment=india, world_sentiment=world,
+        )
         assert "Overnight" in title and "BULLISH" in title
         assert "NIFTY +" in title                       # gap points in title
         assert "S&P +0.80%" in body and "Nasdaq +1.10%" in body
         assert "India VIX" in body
+        assert "India news: BULLISH (5↑/1↓)" in body     # sentiment integrated
+        assert "World news: BEARISH (1↑/3↓)" in body
         assert "Implied open" in body
         assert "Usually:" in body                        # base-rate verdict
         assert "HEADLINES" in body and "RBI holds rates" in body
         assert "not a signal" in body                    # disclaimer
+
+    def test_sentiment_omitted_when_no_headlines(self):
+        empty = NewsSentiment(score=0.0, bullish_hits=0, bearish_hits=0, headlines=0)
+        _, body = format_overnight_analysis(
+            _indices(), "NEUTRAL", None, None, [],
+            india_sentiment=empty, world_sentiment=empty,
+        )
+        assert "news:" not in body                        # nothing to show
 
     def test_no_gift_falls_back_to_bias_only_title(self):
         title, body = format_overnight_analysis(_indices(), "NEUTRAL", None, None, [])

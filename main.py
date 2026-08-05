@@ -672,6 +672,7 @@ def _run_overnight_analysis() -> None:
     from nifty_ai_agent.data.market_context import compute_global_bias, fetch_global_indices
     from nifty_ai_agent.data.news_fetcher import fetch_news
     from nifty_ai_agent.reports.overnight import format_overnight_analysis
+    from nifty_ai_agent.strategies.global_analyser import analyse_news
 
     indices = []
     try:
@@ -706,13 +707,23 @@ def _run_overnight_analysis() -> None:
     except Exception as exc:
         logger.warning("Overnight analysis: news failed: %s", exc)
 
+    # Market sentiment scored separately for Indian and world headlines.
+    india_sentiment = analyse_news([n for n in news if n.region == "IN"])
+    world_sentiment = analyse_news([n for n in news if n.region == "WORLD"])
+
     if not indices and outlook is None:
         logger.warning("Overnight analysis: no data gathered — skipping notification.")
         return
 
-    title, body = format_overnight_analysis(indices, bias, outlook, stats, news)
+    title, body = format_overnight_analysis(
+        indices, bias, outlook, stats, news,
+        india_sentiment=india_sentiment, world_sentiment=world_sentiment,
+    )
     _send_notification(settings, title, body)
-    logger.info("Overnight analysis sent (bias=%s, gift=%s)", bias, gift is not None)
+    logger.info(
+        "Overnight analysis sent (bias=%s, IN news=%s, WORLD news=%s)",
+        bias, india_sentiment.label, world_sentiment.label,
+    )
 
 
 def _run_morning_report() -> None:
