@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session
 from nifty_ai_agent.database.models import (
     Base,
     MarketDataRecord,
+    PositionRecord,
     SignalRecord,
     Subscriber,
     TradeRecord,
@@ -135,6 +136,104 @@ class DatabaseRepository:
             record.exit_time = datetime.now(tz=timezone.utc)
             record.pnl = exit_price - record.entry_price
             session.commit()
+
+    # ── Tracked option positions ─────────────────────────────────────
+
+    def open_position(
+        self,
+        *,
+        underlying: str,
+        opt_type: str,
+        strike: float,
+        expiry: str,
+        entry_spot: float,
+        stop_loss: float,
+        target: float,
+        entry_premium: float = 0.0,
+        lot_size: int = 0,
+        strategy: str = "",
+        conviction: str = "",
+        confidence: int = 0,
+    ) -> int | None:
+        """Track a new position for *underlying*, or return None if one is already open.
+
+        One position per underlying at a time — the 5-minute signal loop would
+        otherwise open a fresh position on every cycle the consensus stays bullish.
+        """
+        with Session(self._engine) as session:
+            existing = session.scalars(
+                select(PositionRecord).where(
+                    PositionRecord.underlying == underlying,
+                    PositionRecord.status == "OPEN",
+                )
+            ).first()
+            if existing is not None:
+                logger.debug(
+                    "Position already open for %s (id=%d) — not opening another",
+                    underlying, existing.id,
+                )
+                return None
+
+            record = PositionRecord(
+                underlying=underlying,
+                opt_type=opt_type,
+                strike=strike,
+                expiry=expiry,
+                lot_size=lot_size,
+                entry_premium=entry_premium,
+                entry_spot=entry_spot,
+                stop_loss=stop_loss,
+                target=target,
+                strategy=strategy,
+                conviction=conviction,
+                confidence=confidence,
+                status="OPEN",
+                opened_at=datetime.now(tz=timezone.utc),
+            )
+            session.add(record)
+            session.commit()
+            session.refresh(record)
+            logger.info(
+                "Position opened: %s %g%s %s (entry spot %.2f)",
+                underlying, strike, opt_type, expiry, entry_spot,
+            )
+            return record.id
+
+    def list_open_positions(self, underlying: str = "") -> list[PositionRecord]:
+        """Every OPEN position, or only those for *underlying* when given."""
+        with Session(self._engine) as session:
+            stmt = select(PositionRecord).where(PositionRecord.status == "OPEN")
+            if underlying:
+                stmt = stmt.where(PositionRecord.underlying == underlying)
+            return list(session.scalars(stmt.order_by(PositionRecord.opened_at)).all())
+
+    def list_closed_positions(self, limit: int = 500) -> list[PositionRecord]:
+        """Most recently closed positions, newest first — the input to scoring."""
+        with Session(self._engine) as session:
+            stmt = (
+                select(PositionRecord)
+                .where(PositionRecord.status == "CLOSED")
+                .order_by(PositionRecord.closed_at.desc())
+                .limit(limit)
+            )
+            return list(session.scalars(stmt).all())
+
+    def close_position(self, position_id: int, exit_spot: float, reason: str) -> None:
+        """Mark a tracked position closed so it stops appearing in notifications."""
+        with Session(self._engine) as session:
+            record = session.get(PositionRecord, position_id)
+            if record is None:
+                logger.warning("Position id=%d not found", position_id)
+                return
+            record.status = "CLOSED"
+            record.exit_spot = exit_spot
+            record.exit_reason = reason[:120]
+            record.closed_at = datetime.now(tz=timezone.utc)
+            session.commit()
+            logger.info(
+                "Position closed: %s %g%s — %s",
+                record.underlying, record.strike, record.opt_type, reason,
+            )
 
     # ── Telegram subscribers ─────────────────────────────────────────
 
