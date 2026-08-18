@@ -43,12 +43,12 @@ class TestTelegramNotifier:
     def test_send_message_success(self, monkeypatch):
         captured = {}
 
-        def _post(url, data, timeout):
+        def _post(self, url, data, timeout):
             captured["url"] = url
             captured["data"] = data
             return _Resp(ok=True)
 
-        monkeypatch.setattr(tg.requests, "post", _post)
+        monkeypatch.setattr(tg.requests.Session, "post", _post)
         assert TelegramNotifier("TOK").send_message(42, "hi") is True
         assert captured["data"]["chat_id"] == 42
         assert captured["data"]["text"] == "hi"
@@ -57,8 +57,8 @@ class TestTelegramNotifier:
     def test_monospace_wraps_in_pre_and_escapes(self, monkeypatch):
         captured = {}
         monkeypatch.setattr(
-            tg.requests, "post",
-            lambda url, data, timeout: captured.update(data) or _Resp(ok=True),
+            tg.requests.Session, "post",
+            lambda self, url, data, timeout: captured.update(data) or _Resp(ok=True),
         )
         TelegramNotifier("TOK").send_message(42, "a < b & c", monospace=True)
         assert captured["parse_mode"] == "HTML"
@@ -67,8 +67,8 @@ class TestTelegramNotifier:
     def test_silent_sets_disable_notification(self, monkeypatch):
         captured = {}
         monkeypatch.setattr(
-            tg.requests, "post",
-            lambda url, data, timeout: captured.update(data) or _Resp(ok=True),
+            tg.requests.Session, "post",
+            lambda self, url, data, timeout: captured.update(data) or _Resp(ok=True),
         )
         TelegramNotifier("TOK").send_message(42, "heartbeat", silent=True)
         assert captured.get("disable_notification") is True
@@ -76,14 +76,14 @@ class TestTelegramNotifier:
     def test_default_is_not_silent(self, monkeypatch):
         captured = {}
         monkeypatch.setattr(
-            tg.requests, "post",
-            lambda url, data, timeout: captured.update(data) or _Resp(ok=True),
+            tg.requests.Session, "post",
+            lambda self, url, data, timeout: captured.update(data) or _Resp(ok=True),
         )
         TelegramNotifier("TOK").send_message(42, "buzz")
         assert "disable_notification" not in captured
 
     def test_blocked_raises(self, monkeypatch):
-        monkeypatch.setattr(tg.requests, "post", lambda *a, **k: _Resp(status_code=403))
+        monkeypatch.setattr(tg.requests.Session, "post", lambda *a, **k: _Resp(status_code=403))
         with pytest.raises(TelegramBlockedError):
             TelegramNotifier("TOK").send_message(42, "hi")
 
@@ -94,15 +94,15 @@ class TestTelegramNotifier:
             calls["n"] += 1
             return _Resp(ok=False, description="boom")
 
-        monkeypatch.setattr(tg.requests, "post", _post)
+        monkeypatch.setattr(tg.requests.Session, "post", _post)
         monkeypatch.setattr(tg.time, "sleep", lambda *_: None)  # no real backoff
         assert TelegramNotifier("TOK").send_message(42, "hi") is False
         assert calls["n"] == 3
 
     def test_get_updates_returns_results(self, monkeypatch):
         monkeypatch.setattr(
-            tg.requests, "get",
-            lambda url, params, timeout: _Resp(result=[{"update_id": 1}]),
+            tg.requests.Session, "get",
+            lambda self, url, params, timeout: _Resp(result=[{"update_id": 1}]),
         )
         assert TelegramNotifier("TOK").get_updates(offset=5) == [{"update_id": 1}]
 
@@ -112,16 +112,16 @@ class TestTelegramNotifier:
 class TestBroadcast:
     def test_fans_out_and_counts_delivered(self, monkeypatch):
         sent = []
-        monkeypatch.setattr(tg.requests, "post", lambda url, data, timeout: sent.append(data["chat_id"]) or _Resp(ok=True))
+        monkeypatch.setattr(tg.requests.Session, "post", lambda self, url, data, timeout: sent.append(data["chat_id"]) or _Resp(ok=True))
         delivered, blocked = broadcast(TelegramNotifier("TOK"), [1, 2, 3], "signal")
         assert delivered == 3 and blocked == []
         assert sent == [1, 2, 3]
 
     def test_collects_blocked_chats(self, monkeypatch):
-        def _post(url, data, timeout):
+        def _post(self, url, data, timeout):
             return _Resp(status_code=403) if data["chat_id"] == 2 else _Resp(ok=True)
 
-        monkeypatch.setattr(tg.requests, "post", _post)
+        monkeypatch.setattr(tg.requests.Session, "post", _post)
         delivered, blocked = broadcast(TelegramNotifier("TOK"), [1, 2, 3], "signal")
         assert delivered == 2 and blocked == [2]
 
@@ -199,3 +199,49 @@ class TestHandleUpdate:
 
     def test_non_message_update_ignored(self, store):
         assert handle_update({"edited_message": {}}, store) is None
+
+
+class TestGetUpdatesFailureModes:
+    """A quiet long poll and a broken one must not look the same to the caller."""
+
+    def test_read_timeout_is_treated_as_no_updates(self, monkeypatch):
+        """Telegram holding a quiet poll open until the deadline is normal, not an error."""
+        def _timeout(self, url, params, timeout):
+            raise tg.requests.Timeout("read timed out")
+
+        monkeypatch.setattr(tg.requests.Session, "get", _timeout)
+        assert TelegramNotifier("TOK").get_updates(offset=1) == []
+
+    def test_conflict_propagates_so_the_caller_backs_off(self, monkeypatch):
+        """HTTP 409 = a second poller holds this token. Returning [] would hot-spin."""
+        monkeypatch.setattr(
+            tg.requests.Session, "get",
+            lambda self, url, params, timeout: _Resp(status_code=409),
+        )
+        with pytest.raises(tg.requests.HTTPError):
+            TelegramNotifier("TOK").get_updates()
+
+    def test_connection_error_propagates(self, monkeypatch):
+        def _boom(self, url, params, timeout):
+            raise tg.requests.ConnectionError("dns failure")
+
+        monkeypatch.setattr(tg.requests.Session, "get", _boom)
+        with pytest.raises(tg.requests.ConnectionError):
+            TelegramNotifier("TOK").get_updates()
+
+    def test_read_deadline_exceeds_the_poll_window(self, monkeypatch):
+        """The read timeout must outlast the poll Telegram was asked to hold."""
+        seen = {}
+        monkeypatch.setattr(
+            tg.requests.Session, "get",
+            lambda self, url, params, timeout: seen.update(
+                poll=params["timeout"], read=timeout
+            ) or _Resp(result=[]),
+        )
+        TelegramNotifier("TOK").get_updates(timeout=25)
+        assert seen["read"] > seen["poll"]
+
+    def test_notifier_reuses_one_session(self):
+        """A fresh handshake per 25s poll is thousands a day, each a chance to time out."""
+        n = TelegramNotifier("TOK")
+        assert isinstance(n._session, tg.requests.Session)

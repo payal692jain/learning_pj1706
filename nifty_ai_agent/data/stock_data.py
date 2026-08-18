@@ -90,6 +90,9 @@ def _fetch_via_upstox(
     for sym in symbols:
         bare = sym[: -len(_NS_SUFFIX)] if sym.endswith(_NS_SUFFIX) else sym
         try:
+            # equity_key() follows the rename table, so a ticker retired by a
+            # demerger resolves to its successor here rather than falling through
+            # to yfinance and 404-ing on a symbol that no longer exists.
             key = master.equity_key(bare)
             if not key:
                 continue

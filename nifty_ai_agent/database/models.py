@@ -59,6 +59,41 @@ class Subscriber(Base):
     subscribed_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
 
 
+class PositionRecord(Base):
+    """One suggested option position the agent is tracking to a HOLD/SELL verdict.
+
+    Opened when a STRONG-conviction BUY_CE/BUY_PE fires for an underlying that has
+    no open position, so a 5-minute signal loop cannot pile up dozens of phantom
+    positions. Closed when the underlying reaches the target or stop-loss, or when
+    the consensus reverses.
+    """
+
+    __tablename__ = "positions"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    # "NIFTY" / "BANKNIFTY" / "RELIANCE" — the underlying, not the contract.
+    underlying: Mapped[str] = mapped_column(String(30), nullable=False, index=True)
+    opt_type: Mapped[str] = mapped_column(String(2), nullable=False)      # CE / PE
+    strike: Mapped[float] = mapped_column(Float, nullable=False)
+    expiry: Mapped[str] = mapped_column(String(20), nullable=False)       # DD-Mon-YYYY
+    lot_size: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    entry_premium: Mapped[float] = mapped_column(Float, nullable=False, default=0.0)
+    entry_spot: Mapped[float] = mapped_column(Float, nullable=False)
+    stop_loss: Mapped[float] = mapped_column(Float, nullable=False)       # on the underlying
+    target: Mapped[float] = mapped_column(Float, nullable=False)          # on the underlying
+
+    strategy: Mapped[str] = mapped_column(String(50), nullable=False, default="")
+    conviction: Mapped[str] = mapped_column(String(20), nullable=False, default="")
+    confidence: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+
+    status: Mapped[str] = mapped_column(String(20), nullable=False, default="OPEN", index=True)
+    opened_at: Mapped[datetime] = mapped_column(DateTime, nullable=False)
+    closed_at: Mapped[datetime] = mapped_column(DateTime, nullable=True)
+    exit_spot: Mapped[float] = mapped_column(Float, nullable=True)
+    exit_reason: Mapped[str] = mapped_column(String(120), nullable=True)
+
+
 class TradeRecord(Base):
     __tablename__ = "trades"
 

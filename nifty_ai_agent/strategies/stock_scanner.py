@@ -13,16 +13,24 @@ single-stock read would be borrowing conviction the stock hasn't earned.
 """
 
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import time as dt_time
 
 import pandas as pd
 
-from nifty_ai_agent.data.instrument_master import InstrumentMaster, OptionContract
+from nifty_ai_agent.data.fundamentals import volume_pace_ratio
+from nifty_ai_agent.data.instrument_master import (
+    SEGMENT_EQUITY_FO,
+    InstrumentMaster,
+    OptionContract,
+)
 from nifty_ai_agent.risk.calculator import RiskCalculator
 from nifty_ai_agent.strategies.base import BaseStrategy, SignalType
 from nifty_ai_agent.strategies.consensus import build_consensus
-from nifty_ai_agent.strategies.option_analyser import compute_atm_theoretical_prices
+from nifty_ai_agent.strategies.option_analyser import (
+    compute_atm_theoretical_prices,
+    estimate_premium_at_spot,
+)
 from nifty_ai_agent.strategies.pipeline import DEFAULT_STRATEGIES, compute_all_indicators
 
 logger = logging.getLogger(__name__)
@@ -51,6 +59,30 @@ class StockIdea:
     target: float          # target on the UNDERLYING
     stop_loss: float       # stop-loss on the UNDERLYING
     rr: float
+    # What the CONTRACT is worth if the underlying reaches those levels today.
+    # The underlying target answers "where is the stock going"; these answer the
+    # question an intraday option trade actually turns on — what to sell at.
+    # Same-session estimate: no overnight theta is taken out.
+    target_premium: float = 0.0
+    stop_premium: float = 0.0
+    # Event/fundamental context — None when nothing was fetched for this name.
+    fundamentals: object | None = None
+    volume_ratio: float | None = None   # pace-adjusted vs 20d average
+
+
+@dataclass
+class HoldRead:
+    """A symbol that scanned cleanly but produced no trade.
+
+    Kept rather than discarded so a small watchlist can show its current read
+    instead of the symbol silently vanishing from the digest — on a two-name book,
+    "BSE is undecided" and "BSE was never scanned" look identical otherwise.
+    """
+    symbol: str
+    confidence: int
+    conviction: str
+    spot: float
+    reason: str = ""   # e.g. "results in 2d" when an event blocked the entry
 
 
 @dataclass
@@ -59,6 +91,7 @@ class ScanResult:
     scanned: int            # symbols with usable data
     actionable: int         # symbols that produced a (pre-ranking) idea
     errors: int             # symbols that raised while being processed
+    holds: list[HoldRead] = field(default_factory=list)  # scanned, but no trade
 
 
 def _premium_lookup(instrument_keys: list[str]) -> dict[str, float]:
@@ -79,6 +112,9 @@ def scan_stocks(
     strategies: list[BaseStrategy] | None = None,
     allow_expiry_day: bool | None = None,
     intraday: bool = False,
+    segment: str = SEGMENT_EQUITY_FO,
+    fundamentals: dict | None = None,
+    earnings_blackout_days: int = 0,
 ) -> ScanResult:
     """Scan every symbol in *histories* and return the best monthly option ideas.
 
@@ -97,9 +133,15 @@ def scan_stocks(
         intraday: apply the consensus engine's intraday-only rules (time-of-day
             weighting and the late-session entry cutoff). Defaults False, because a
             monthly stock option is not disqualified by an afternoon entry.
+        segment: derivatives book the contracts live in — NSE_FO for stocks,
+            NCD_FO for currency pairs.
+        fundamentals: {bare symbol: StockFundamentals} for event context.
+        earnings_blackout_days: refuse a new entry when results are this many
+            days away or fewer. 0 disables the guard.
     """
     strategies = strategies or DEFAULT_STRATEGIES
     ideas: list[StockIdea] = []
+    holds: list[HoldRead] = []
     scanned = errors = 0
 
     for symbol, hist in histories.items():
@@ -111,13 +153,17 @@ def scan_stocks(
             idea = _build_idea(
                 symbol, hist, spot, master, risk_calculator, strategies,
                 now=now, premium_lookup=premium_lookup, default_iv=default_iv,
-                allow_expiry_day=allow_expiry_day, intraday=intraday,
+                allow_expiry_day=allow_expiry_day, intraday=intraday, segment=segment,
+                fundamentals=fundamentals or {},
+                earnings_blackout_days=earnings_blackout_days,
             )
         except Exception as exc:
             errors += 1
             logger.warning("Stock scan: %s failed — %s", symbol, exc)
             continue
-        if idea is not None:
+        if isinstance(idea, HoldRead):
+            holds.append(idea)
+        elif idea is not None:
             ideas.append(idea)
 
     ideas.sort(key=lambda i: i.confidence, reverse=True)
@@ -127,6 +173,7 @@ def scan_stocks(
     )
     return ScanResult(
         ideas=ideas[:top_n], scanned=scanned, actionable=len(ideas), errors=errors,
+        holds=holds,
     )
 
 
@@ -143,8 +190,16 @@ def _build_idea(
     default_iv: float,
     allow_expiry_day: bool | None,
     intraday: bool,
-) -> StockIdea | None:
-    """Run the full pipeline for one stock; return an idea or None (no trade)."""
+    segment: str = SEGMENT_EQUITY_FO,
+    fundamentals: dict | None = None,
+    earnings_blackout_days: int = 0,
+) -> StockIdea | HoldRead | None:
+    """Run the full pipeline for one stock.
+
+    Returns a StockIdea when the consensus is actionable and a contract prices,
+    a HoldRead when the symbol scanned fine but the engine wants no trade, and
+    None only when the data itself was unusable.
+    """
     df = compute_all_indicators(hist)
     usable = df.dropna(subset=_REQUIRED_COLS)
     if usable.empty:
@@ -155,14 +210,32 @@ def _build_idea(
 
     signals = [s.generate_signal(df) for s in strategies]
     consensus = build_consensus(signals, now=now, intraday=intraday)
-    if not consensus.is_actionable:
-        return None
-
     asset = symbol[: -len(_NS_SUFFIX)] if symbol.endswith(_NS_SUFFIX) else symbol
-    opt_type = "CE" if consensus.signal == SignalType.BUY_CE else "PE"
+    if not consensus.is_actionable:
+        return HoldRead(
+            symbol=asset, confidence=consensus.confidence,
+            conviction=consensus.conviction, spot=round(spot, 2),
+        )
 
+    # ── Event guard ──────────────────────────────────────────────────────────
+    # A chart cannot see a results date. Long premium into a print is a different
+    # trade: the gap can run through any stop, and the post-result IV collapse
+    # takes value out even when the direction was right. Refuse the entry and say
+    # why, rather than emitting a technical signal that does not know about it.
+    fund = (fundamentals or {}).get(asset)
+    if earnings_blackout_days and fund is not None:
+        dte = fund.days_to_earnings
+        if dte is not None and dte <= earnings_blackout_days:
+            logger.info("Stock scan: %s blocked — results in %dd", asset, dte)
+            return HoldRead(
+                symbol=asset, confidence=consensus.confidence,
+                conviction=consensus.conviction, spot=round(spot, 2),
+                reason=f"results in {dte}d" if dte else "results today",
+            )
+
+    opt_type = "CE" if consensus.signal == SignalType.BUY_CE else "PE"
     contract = master.atm_contract(
-        asset, spot, opt_type, allow_expiry_day=allow_expiry_day,
+        asset, spot, opt_type, allow_expiry_day=allow_expiry_day, segment=segment,
     )
     if contract is None:
         logger.info("Stock scan: %s — no %s contract available, skipping", asset, opt_type)
@@ -176,7 +249,17 @@ def _build_idea(
         logger.info("Stock scan: %s — no usable premium, skipping", asset)
         return None
 
+    volume_ratio = None
+    if fund is not None and "volume" in hist.columns:
+        last_day = hist[hist.index.date == hist.index[-1].date()]
+        volume_ratio = volume_pace_ratio(
+            float(last_day["volume"].sum()), fund.avg_volume, now,
+        )
+
     risk = risk_calculator.calculate(consensus.signal, spot, atr)
+    target_premium, stop_premium = _project_premiums(
+        entry_premium, spot, risk, contract, expiry_str, opt_type, default_iv,
+    )
 
     return StockIdea(
         symbol=asset,
@@ -186,14 +269,53 @@ def _build_idea(
         opt_type=opt_type,
         strike=contract.strike,
         expiry=expiry_str,
-        lot_size=contract.lot_size,
+        lot_size=contract.contract_size,
         entry_premium=entry_premium,
         is_live=is_live,
         spot=round(spot, 2),
         target=risk.target,
         stop_loss=risk.stop_loss,
         rr=risk.risk_reward_ratio,
+        target_premium=target_premium,
+        stop_premium=stop_premium,
+        fundamentals=fund,
+        volume_ratio=volume_ratio,
     )
+
+
+def _project_premiums(
+    entry_premium: float,
+    spot: float,
+    risk,
+    contract: OptionContract,
+    expiry_str: str,
+    opt_type: str,
+    iv: float,
+) -> tuple[float, float]:
+    """Premium if the underlying reaches the target, and if it reaches the stop.
+
+    Anchored on the live entry premium and moved by the Black-Scholes *delta* over
+    that spot move, so any model-vs-market basis cancels out. Held flat in time:
+    an intraday trade closes the same session, so taking days of theta out of the
+    exit price would understate what the position is actually worth when the level
+    prints. Returns (0.0, 0.0) when risk levels are unusable, and the callers
+    render those as blank rather than as a Rs 0 target.
+    """
+    if not risk.is_valid or entry_premium <= 0 or spot <= 0:
+        return 0.0, 0.0
+    strike = int(round(contract.strike))
+    try:
+        return (
+            estimate_premium_at_spot(
+                entry_premium, spot, risk.target, strike, expiry_str, iv, opt_type,
+            ),
+            estimate_premium_at_spot(
+                entry_premium, spot, risk.stop_loss, strike, expiry_str, iv, opt_type,
+            ),
+        )
+    except Exception as exc:
+        logger.debug("Premium projection failed for %s: %s", contract.trading_symbol, exc)
+        return 0.0, 0.0
 
 
 def _resolve_premium(

@@ -21,6 +21,11 @@ _API_BASE = "https://api.telegram.org/bot"
 _RETRY_COUNT = 3
 _RETRY_DELAY = 2  # seconds
 _TIMEOUT = 15
+# Read deadline for a long poll = the poll's own timeout plus this. Telegram holds
+# the connection for the full poll window before answering, so the margin covers
+# only network latency — but it has to cover a bad minute on a home connection,
+# not just a good one, or an ordinary blip is logged as a failure.
+_POLL_READ_MARGIN = 20
 # Telegram rejects a message body over 4096 characters.
 TELEGRAM_LIMIT = 4096
 
@@ -35,6 +40,10 @@ class TelegramNotifier:
 
     def __init__(self, bot_token: str) -> None:
         self._token = bot_token
+        # One Session per notifier so the polling loop reuses a single TCP+TLS
+        # connection. Without it every 25-second poll pays a fresh handshake —
+        # thousands a day, each one an extra chance to blow the read deadline.
+        self._session = requests.Session()
 
     def _url(self, method: str) -> str:
         return f"{_API_BASE}{self._token}/{method}"
@@ -64,7 +73,9 @@ class TelegramNotifier:
 
         for attempt in range(1, _RETRY_COUNT + 1):
             try:
-                resp = requests.post(self._url("sendMessage"), data=payload, timeout=_TIMEOUT)
+                resp = self._session.post(
+                    self._url("sendMessage"), data=payload, timeout=_TIMEOUT,
+                )
                 if resp.status_code == 403:
                     raise TelegramBlockedError(f"chat {chat_id} blocked the bot")
                 resp.raise_for_status()
@@ -83,16 +94,28 @@ class TelegramNotifier:
         return False
 
     def get_updates(self, offset: int | None = None, timeout: int = 25) -> list[dict]:
-        """Long-poll for new updates. Returns the raw update dicts (may be empty)."""
+        """Long-poll for new updates. Returns the raw update dicts (may be empty).
+
+        A read timeout is the *expected* outcome of a quiet long poll, so it comes
+        back as "no updates" rather than an error — logging it as a failure makes a
+        healthy idle bot look broken.
+
+        Every other failure (HTTP 409 from a second poller, DNS, 5xx) propagates:
+        those do not self-heal, and returning [] for them would spin this loop as
+        fast as the network can refuse it. The caller backs off instead.
+        """
         params: dict = {"timeout": timeout}
         if offset is not None:
             params["offset"] = offset
         try:
-            resp = requests.get(self._url("getUpdates"), params=params, timeout=timeout + 10)
+            resp = self._session.get(
+                self._url("getUpdates"), params=params,
+                timeout=timeout + _POLL_READ_MARGIN,
+            )
             resp.raise_for_status()
             return resp.json().get("result", [])
-        except (requests.RequestException, ValueError) as exc:
-            logger.warning("Telegram getUpdates failed: %s", exc)
+        except requests.Timeout:
+            logger.debug("Telegram getUpdates: quiet poll timed out — re-polling")
             return []
 
 

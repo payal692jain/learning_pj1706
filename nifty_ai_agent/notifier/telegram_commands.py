@@ -23,12 +23,18 @@ WELCOME = (
 )
 
 HELP = (
-    "Commands:\n"
-    "/start — subscribe\n"
-    "/stop — unsubscribe\n"
-    "/setcapital 100000 — set deployable capital (₹)\n"
-    "/risk 1 — set % risked per trade (0–10)\n"
+    "📊 ANALYSE\n"
+    "/analyse NIFTY — index: direction, votes, levels, ATM contract\n"
+    "/analyse RELIANCE — stock: buy the shares? intraday option?\n"
+    "   works for NIFTY · BANKNIFTY · SENSEX and any NSE F&O stock\n"
+    "\n⚙️ YOUR SETTINGS\n"
+    "/setcapital 100000 — deployable capital (₹)\n"
+    "/risk 1 — % risked per trade (0–10)\n"
     "/status — show your settings\n"
+    "\n📈 TRACK\n"
+    "/performance — hit rate of closed calls\n"
+    "\n🔔 SUBSCRIPTION\n"
+    "/start — subscribe   /stop — unsubscribe\n"
     "/help — this message"
 )
 
@@ -61,9 +67,15 @@ def handle_update(update: dict, store) -> tuple[int, str] | None:
         return None
 
     username = chat.get("username") or chat.get("first_name") or ""
-    command, arg = parse_command(message.get("text", ""))
+    text = (message.get("text") or "").strip()
+    command, arg = parse_command(text)
     if not command:
-        return chat_id, "Send /help to see what I can do."
+        # Plain text, no slash: if it names a real instrument, just analyse it.
+        # Making people remember a command name is the main thing that stops a
+        # bot like this from being used.
+        if _is_tradeable(text):
+            return chat_id, _analyse(text)
+        return chat_id, "Send /help to see what I can do, or a symbol like NIFTY."
     return chat_id, _dispatch(command, arg, chat_id, username, store)
 
 
@@ -96,10 +108,95 @@ def _dispatch(command: str, arg: str, chat_id: int, username: str, store) -> str
             return "You're not subscribed. Send /start to begin."
         return f"Subscribed. Capital ₹{sub.capital:,.0f}, risk {sub.risk_pct:g}% per trade."
 
+    if command in ("performance", "stats", "score"):
+        from nifty_ai_agent.backtesting.scorecard import (
+            build_scorecard, format_scorecard,
+        )
+        return format_scorecard(build_scorecard(store.list_closed_positions()))
+
+    if command in ("analyse", "analyze", "stock"):
+        if not arg:
+            return (
+                "What should I analyse?\n\n"
+                "  /analyse NIFTY\n"
+                "  /analyse BANKNIFTY\n"
+                "  /analyse RELIANCE\n\n"
+                "Any of NIFTY · BANKNIFTY · SENSEX, or an NSE F&O stock symbol."
+            )
+        return _analyse(arg)
+
     if command in ("help", "commands"):
         return HELP
 
-    return "Unknown command. Send /help."
+    # A bare symbol is what people type first ("/nifty", "/reliance"), so treat it
+    # as an analysis request — but only if it actually resolves to a tradeable
+    # instrument. Guessing from shape alone would send every mistyped command
+    # ("/frobnicate") through a slow network analysis to reach a confusing error.
+    if _is_tradeable(command):
+        return _analyse(command)
+
+    return "Unknown command. Send /help, or a symbol like NIFTY or RELIANCE."
+
+
+def _is_tradeable(word: str) -> bool:
+    """True when *word* names an index or a live NSE equity.
+
+    Resolved rather than pattern-matched, so a typo'd command is reported as an
+    unknown command instead of being sent through a network analysis that fails
+    slowly and confusingly. Index aliases are checked first because they are an
+    in-memory dict; the instrument master is only consulted for the rest, and it
+    is process-cached after its first load.
+    """
+    candidate = " ".join(word.strip().split())
+    if not candidate or len(candidate) > 20:
+        return False
+
+    from nifty_ai_agent.reports.analyse_index import resolve_index
+
+    if resolve_index(candidate):
+        return True
+    if not candidate.replace(".", "").isalnum():
+        return False
+
+    try:
+        from nifty_ai_agent.data.instrument_master import get_instrument_master
+
+        bare = candidate.upper().removesuffix(".NS")
+        return get_instrument_master().resolve_equity(bare) is not None
+    except Exception as exc:
+        # A master we cannot read should not turn every word into a symbol.
+        logger.debug("Symbol check failed for %r: %s", word, exc)
+        return False
+
+
+def _analyse(symbol: str) -> str:
+    """Run the on-demand analysis for *symbol* — index or stock.
+
+    Indices are checked first: they have their own path (live option chain, no
+    fundamentals) and "NIFTY" would otherwise be looked up as an equity ticker
+    and come back as "no price data".
+
+    Imported lazily: this pulls in pandas, yfinance and the whole strategy stack,
+    which the command parser has no other reason to load — and which would make
+    every unit test of this module pay for them.
+    """
+    from nifty_ai_agent.config import get_settings
+    from nifty_ai_agent.reports.analyse_index import analyse_index, resolve_index
+
+    settings = get_settings()
+
+    index = resolve_index(symbol)
+    if index:
+        return analyse_index(index, settings)
+
+    from nifty_ai_agent.reports.analyse_one import analyse_stock
+
+    lookup = None
+    if settings.upstox_access_token:
+        from nifty_ai_agent.data.upstox_provider import UpstoxClient
+        client = UpstoxClient(settings.upstox_access_token)
+        lookup = client.get_ltp
+    return analyse_stock(symbol, settings, premium_lookup=lookup)
 
 
 def _parse_positive(arg: str) -> float | None:
