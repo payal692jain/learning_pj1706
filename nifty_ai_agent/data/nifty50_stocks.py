@@ -8,7 +8,11 @@ import yfinance as yf
 
 logger = logging.getLogger(__name__)
 
-# NIFTY 50 constituents as of 2025 (NSE symbols with .NS suffix for yfinance)
+# NIFTY 50 constituents (NSE symbols with .NS suffix for yfinance).
+#
+# TATAMOTORS is gone: the demerger split it into TMPV (passenger vehicles) and
+# TMCV (commercial vehicles). TMPV is the one carrying the F&O book, so it takes
+# the slot — TMCV is cash-only and no use to an option scanner.
 NIFTY50_SYMBOLS: list[str] = [
     "ADANIENT.NS", "ADANIPORTS.NS", "APOLLOHOSP.NS", "ASIANPAINT.NS", "AXISBANK.NS",
     "BAJAJ-AUTO.NS", "BAJAJFINSV.NS", "BAJFINANCE.NS", "BHARTIARTL.NS", "BPCL.NS",
@@ -18,7 +22,7 @@ NIFTY50_SYMBOLS: list[str] = [
     "INFY.NS", "ITC.NS", "JSWSTEEL.NS", "KOTAKBANK.NS", "LT.NS",
     "M&M.NS", "MARUTI.NS", "NESTLEIND.NS", "NTPC.NS", "ONGC.NS",
     "POWERGRID.NS", "RELIANCE.NS", "SBILIFE.NS", "SBIN.NS", "SHRIRAMFIN.NS",
-    "SUNPHARMA.NS", "TATACONSUM.NS", "TATAMOTORS.NS", "TATASTEEL.NS", "TCS.NS",
+    "SUNPHARMA.NS", "TATACONSUM.NS", "TMPV.NS", "TATASTEEL.NS", "TCS.NS",
     "TECHM.NS", "TITAN.NS", "TRENT.NS", "ULTRACEMCO.NS", "WIPRO.NS",
 ]
 
