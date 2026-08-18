@@ -155,6 +155,37 @@ class Settings(BaseSettings):
         ),
     )
 
+    earnings_blackout_days: int = Field(
+        default=3,
+        description=(
+            "Refuse a new single-stock option entry when quarterly results are "
+            "this many calendar days away or fewer. Long premium into a print is "
+            "a different trade: the gap can run through any stop, and the "
+            "post-result IV collapse drains value even when direction is right. "
+            "Set 0 to disable the guard"
+        ),
+    )
+    stock_news_limit: int = Field(
+        default=4, description="Headlines fetched per stock for event detection"
+    )
+
+    # ── BSE Ltd + NSE currency scan ─────────────────────────────
+    bse_currency_scan_enabled: bool = Field(
+        default=True,
+        description="Scan BSE Ltd stock options and the NSE currency pairs",
+    )
+    bse_currency_scan_interval_minutes: int = Field(
+        default=30, description="Minutes between BSE Ltd + currency scans"
+    )
+    currency_default_iv: float = Field(
+        default=0.06,
+        description=(
+            "Annualised IV (decimal) for the Black-Scholes premium fallback on "
+            "currency options — INR pairs realise far lower vol than equities, so "
+            "the equity default would overstate these premiums several-fold"
+        ),
+    )
+
     # ── Volatile-stock straddle scan (long-volatility plays) ────
     volatility_scan_enabled: bool = Field(
         default=True,

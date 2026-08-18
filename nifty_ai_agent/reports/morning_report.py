@@ -1,5 +1,9 @@
 """Morning report orchestrator — runs at 8 AM, collects all pre-market data,
-generates a full brief and sends it via Pushover in focused sections.
+generates a full brief and sends it out in focused sections.
+
+Delivery goes through the *send* callable so the caller decides the channels —
+main.py passes one that fans out to Pushover *and* every Telegram subscriber.
+Called without it (tests, ad-hoc runs) it falls back to Pushover only.
 
 Message order:
   1. Global markets + GIFT Nifty
@@ -11,7 +15,7 @@ Message order:
 """
 
 import logging
-from dataclasses import dataclass
+from collections.abc import Callable
 
 from nifty_ai_agent.config import Settings
 from nifty_ai_agent.data.market_context import (
@@ -40,33 +44,37 @@ from nifty_ai_agent.strategies.option_analyser import (
 
 logger = logging.getLogger(__name__)
 
+# (title, message, priority) → None. Priority follows Pushover's scale:
+# 1 = high, 0 = normal, -1 = quiet.
+Sender = Callable[[str, str, int], None]
 
-def run_morning_report(settings: Settings) -> None:
-    """Collect all pre-market data and push a Pushover morning brief."""
+
+def run_morning_report(settings: Settings, send: Sender | None = None) -> None:
+    """Collect all pre-market data and push the morning brief.
+
+    *send* delivers one section; defaults to Pushover only.
+    """
     logger.info("=== MORNING REPORT START (8 AM) ===")
-    notifier = PushoverNotifier(
-        user_key=settings.pushover_user_key,
-        api_token=settings.pushover_api_token,
-        enabled=settings.pushover_enabled,
-    )
+    if send is None:
+        send = _pushover_only_sender(settings)
 
     # ── 1. Global markets + GIFT Nifty ─────────────────────────────────────────
     ctx: MarketContext | None = _safe_fetch("global market context", fetch_market_context)
     if ctx:
-        notifier.send_text(
-            title=f"🌍 Pre-Market | {ctx.global_bias}",
-            message=format_context_for_notification(ctx),
-            priority=0,
+        send(
+            f"🌍 Pre-Market | {ctx.global_bias}",
+            format_context_for_notification(ctx),
+            0,
         )
         logger.info("Global context sent: bias=%s", ctx.global_bias)
 
     # ── 2. NIFTY 50 Advance / Decline ──────────────────────────────────────────
     movers: Nifty50Summary | None = _safe_fetch("NIFTY 50 movers", fetch_nifty50_movers)
     if movers:
-        notifier.send_text(
-            title="📊 NIFTY 50 A/D Ratio",
-            message=format_movers_for_notification(movers),
-            priority=0,
+        send(
+            "📊 NIFTY 50 A/D Ratio",
+            format_movers_for_notification(movers),
+            0,
         )
         logger.info("Movers sent: %d↑ %d↓", movers.advances, movers.declines)
 
@@ -84,10 +92,10 @@ def run_morning_report(settings: Settings) -> None:
                 spot=spot_data.price,
                 expiry=chain_data.expiry,
             )
-            notifier.send_text(
-                title=f"📈 Weekly OC | {option_analysis.bias} | PCR {option_analysis.pcr}",
-                message=format_analysis_for_notification(option_analysis),
-                priority=0,
+            send(
+                f"📈 Weekly OC | {option_analysis.bias} | PCR {option_analysis.pcr}",
+                format_analysis_for_notification(option_analysis),
+                0,
             )
             logger.info(
                 "Weekly OC sent: expiry=%s bias=%s max_pain=%.0f",
@@ -108,10 +116,10 @@ def run_morning_report(settings: Settings) -> None:
                 expiry=chain_data.monthly_expiry,
                 strikes_each_side=5,
             )
-            notifier.send_text(
-                title=f"📅 Monthly OC | {monthly_option_analysis.bias} | PCR {monthly_option_analysis.pcr}",
-                message=format_monthly_analysis_for_notification(monthly_option_analysis),
-                priority=0,
+            send(
+                f"📅 Monthly OC | {monthly_option_analysis.bias} | PCR {monthly_option_analysis.pcr}",
+                format_monthly_analysis_for_notification(monthly_option_analysis),
+                0,
             )
             logger.info(
                 "Monthly OC sent: expiry=%s bias=%s max_pain=%.0f",
@@ -136,10 +144,10 @@ def run_morning_report(settings: Settings) -> None:
         if sentiment_lines:
             body = "Sentiment — " + "  ·  ".join(sentiment_lines) + "\n\n" + body
         moods = " / ".join(s.label for s in (india, world) if s.headlines)
-        notifier.send_text(
-            title=f"📰 Market News · {moods}" if moods else "📰 Market News",
-            message=body,
-            priority=-1,
+        send(
+            f"📰 Market News · {moods}" if moods else "📰 Market News",
+            body,
+            -1,
         )
         logger.info(
             "News sent: %d headlines (IN=%s, WORLD=%s)",
@@ -160,10 +168,10 @@ def run_morning_report(settings: Settings) -> None:
                 nifty50_summary=movers,
                 news_items=news_items,
             )
-            notifier.send_text(
-                title="🤖 Claude Daily Plan",
-                message=plan.text,
-                priority=1,   # high priority — this is the most actionable message
+            send(
+                "🤖 Claude Daily Plan",
+                plan.text,
+                1,   # high priority — this is the most actionable message
             )
             logger.info(
                 "Claude daily plan sent (%d tokens)", plan.output_tokens
@@ -175,6 +183,20 @@ def run_morning_report(settings: Settings) -> None:
             logger.info("ANTHROPIC_API_KEY not set — skipping Claude daily plan.")
 
     logger.info("=== MORNING REPORT COMPLETE ===")
+
+
+def _pushover_only_sender(settings: Settings) -> Sender:
+    """Fallback delivery when the caller supplies no sender — Pushover alone."""
+    notifier = PushoverNotifier(
+        user_key=settings.pushover_user_key,
+        api_token=settings.pushover_api_token,
+        enabled=settings.pushover_enabled,
+    )
+
+    def send(title: str, message: str, priority: int) -> None:
+        notifier.send_text(title=title, message=message, priority=priority)
+
+    return send
 
 
 def _safe_fetch(label: str, fn, *args, **kwargs):

@@ -39,8 +39,13 @@ from nifty_ai_agent.config import configure_logging, get_settings
 from nifty_ai_agent.data.bank_options import BankOptionIdea, suggest_bank_options
 from nifty_ai_agent.data.banknifty_breadth import fetch_banknifty_breadth
 from nifty_ai_agent.data.gift_nifty import build_outlook, fetch_gift_nifty
-from nifty_ai_agent.data.instrument_master import get_instrument_master
+from nifty_ai_agent.data.instrument_master import (
+    SEGMENT_CURRENCY_FO,
+    get_instrument_master,
+)
 from nifty_ai_agent.data.nifty50_stocks import NIFTY50_SYMBOLS
+from nifty_ai_agent.data.currency import fetch_currency_histories
+from nifty_ai_agent.data.fundamentals import fetch_fundamentals
 from nifty_ai_agent.data.stock_data import fetch_stock_histories
 from nifty_ai_agent.data.token_health import TokenMonitor
 from nifty_ai_agent.data.breadth import BreadthSnapshot, fetch_realtime_breadth
@@ -48,10 +53,16 @@ from nifty_ai_agent.data.bse_provider import BSEDataProvider
 from nifty_ai_agent.data.nse_provider import NSEDataProvider
 from nifty_ai_agent.data.sensex_breadth import fetch_sensex_breadth
 from nifty_ai_agent.database.repository import DatabaseRepository
+from nifty_ai_agent.positions import (
+    evaluate_position,
+    format_positions_for_notification,
+    should_open_position,
+)
 from nifty_ai_agent.notifier.pushover import PushoverNotifier
 from nifty_ai_agent.reports.morning_report import run_morning_report
 from nifty_ai_agent.reports.next_session import format_next_session
 from nifty_ai_agent.reports.trade_call import format_trade_call
+from nifty_ai_agent.reports.bse_currency import format_bse_currency_scan
 from nifty_ai_agent.reports.stock_scan import format_stock_scan
 from nifty_ai_agent.reports.volatility_scan import format_volatility_scan
 from nifty_ai_agent.reports.trade_plan import (
@@ -71,7 +82,7 @@ from nifty_ai_agent.strategies.global_analyser import (
     global_confidence_adjustment,
 )
 from nifty_ai_agent.strategies.pipeline import compute_all_indicators, DEFAULT_STRATEGIES
-from nifty_ai_agent.strategies.stock_scanner import scan_stocks
+from nifty_ai_agent.strategies.stock_scanner import ScanResult, scan_stocks
 from nifty_ai_agent.strategies.volatility_scanner import scan_volatile_straddles
 from nifty_ai_agent.strategies.option_analyser import (
     ExpiryAnalysis,
@@ -85,6 +96,16 @@ from nifty_ai_agent.strategies.rsi_analyser import analyse_rsi, rsi_confidence_a
 logger = logging.getLogger(__name__)
 
 _IST = pytz.timezone("Asia/Kolkata")
+# BSE Ltd (the exchange company) — an ordinary NSE-listed F&O stock, ticker "BSE".
+# Not a NIFTY 50 constituent, so the stock scanner's universe never reaches it.
+_BSE_SYMBOL = "BSE.NS"
+
+# Telegram long-poll backoff: 5s, 10s, 20s … capped at a minute. After a few
+# failures the log drops to debug so a long outage leaves a trace without
+# drowning every other message in the file.
+_POLL_BACKOFF_BASE = 5
+_POLL_BACKOFF_MAX = 60
+_POLL_QUIET_AFTER = 3
 _MARKET_OPEN_HOUR = 9
 _MARKET_CLOSE_HOUR = 15
 _MARKET_CLOSE_MINUTE = 30
@@ -534,11 +555,33 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         except Exception as exc:
             logger.error("%s: failed to save %s signal: %s", index.name, signal.strategy, exc)
 
+    # ── Open-position management ─────────────────────────────────────────────────
+    # Runs before the notify-threshold gate below: how strong today's *entry* signal
+    # is says nothing about what is already held, and a SELL on an open position is
+    # the most actionable message this agent can send. A below-threshold signal is
+    # still not allowed to open a new position — the user would never have heard the
+    # call it was based on.
+    below_threshold = (
+        consensus.is_actionable and consensus.confidence < settings.min_signal_confidence
+    )
+    positions_block, position_exit = _manage_positions(
+        db, index.name, spot.price, consensus.signal,
+        opt_type="CE" if consensus.signal == SignalType.BUY_CE else "PE",
+        conviction=consensus.conviction,
+        confidence=consensus.confidence,
+        strike=oc_weekly.atm_strike if oc_weekly else 0.0,
+        expiry=oc_weekly.expiry if oc_weekly else "",
+        risk=risk,
+        lot_size=_get_lot_size(index.name),
+        allow_open=not below_threshold,
+    )
+
     # ── Notify every cycle; a HOLD is a silent heartbeat ──────────────────────────
     # Every strategy vote is already saved above. A HOLD ("no trade right now") is
     # still sent, but silently, so the loop is visibly alive without buzzing; an
-    # actionable BUY below the confidence threshold is dropped entirely.
-    if consensus.is_actionable and consensus.confidence < settings.min_signal_confidence:
+    # actionable BUY below the confidence threshold is dropped — unless there is an
+    # open book to report on, which is worth a message on its own.
+    if below_threshold and not positions_block:
         logger.info(
             "%s: %s %d%% below notify threshold (%d%%) — recorded, not notified.",
             index.name, consensus.signal.value, consensus.confidence,
@@ -554,19 +597,37 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         daily_loss_limit_pct=settings.daily_loss_limit_pct,
         max_margin_utilisation_pct=settings.max_margin_utilisation_pct,
     )
-    title, body = format_trade_call(
-        index_name=index.name,
-        consensus=consensus,
-        risk=risk,
-        analysis=oc_weekly,
-        margin=margin_calculator,
-        lot_size=_get_lot_size(index.name),
-        global_snapshot=global_snapshot,
-        bank_ideas=bank_ideas,
-        prediction=after_hours,
-    )
-    if ai_explanation:
-        body = f"{body}\n\n{ai_explanation}"[: 1024]
+    if below_threshold:
+        # Reached only when a position is open: report the book, and do not dress a
+        # signal too weak to act on up as a trade call.
+        title = f"📋 {index.name} — Position Update"
+        body = (
+            f"No fresh entry — {consensus.signal.value} at {consensus.confidence}% is "
+            f"below the {settings.min_signal_confidence}% notify threshold."
+        )
+        silent = True
+    else:
+        title, body = format_trade_call(
+            index_name=index.name,
+            consensus=consensus,
+            risk=risk,
+            analysis=oc_weekly,
+            margin=margin_calculator,
+            lot_size=_get_lot_size(index.name),
+            global_snapshot=global_snapshot,
+            bank_ideas=bank_ideas,
+            prediction=after_hours,
+        )
+        if ai_explanation:
+            body = f"{body}\n\n{ai_explanation}"[: 1024]
+
+    body += positions_block
+
+    # An exit on something already held is the most actionable message the agent
+    # sends, so it buzzes whatever the entry signal was doing — otherwise a SELL
+    # arriving on a HOLD cycle would go out as a silent heartbeat and be missed.
+    if position_exit:
+        silent = False
 
     try:
         PushoverNotifier(
@@ -588,6 +649,82 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         logger.error("%s Pushover failed: %s", index.name, exc)
 
     _broadcast_telegram(title, body, silent=silent)
+
+
+# ── Open-position management ──────────────────────────────────────────────────
+
+def _manage_positions(
+    db: DatabaseRepository,
+    underlying: str,
+    spot: float,
+    signal: SignalType,
+    *,
+    opt_type: str,
+    conviction: str,
+    confidence: int,
+    strike: float,
+    expiry: str,
+    risk,
+    lot_size: int = 0,
+    allow_open: bool = True,
+) -> tuple[str, bool]:
+    """Evaluate open positions for *underlying*, then open one if this call is new.
+
+    Returns *(block, has_exit)* — the OPEN POSITIONS text to append to the
+    notification ("" when nothing is tracked), and whether any position was told to
+    SELL, so the caller can make an exit audible without string-matching the render.
+    Positions that hit their stop, target, or a reversal are closed here so the next
+    cycle stops reporting them.
+
+    *allow_open* False evaluates the existing book without opening anything — used
+    when the fresh signal is below the notify threshold, since a position the user
+    was never told about is not one the agent should start managing.
+
+    Never raises — position tracking is a reporting aid, and a DB hiccup must not
+    take down the signal notification it is attached to.
+    """
+    try:
+        verdicts = [
+            evaluate_position(p, spot, signal)
+            for p in db.list_open_positions(underlying)
+        ]
+        exited = False
+        for v in verdicts:
+            if v.is_exit:
+                db.close_position(v.position.id, spot, v.reason)
+                exited = True
+
+        # Only open once the existing book has been judged, and only off a STRONG
+        # directional call — open_position() itself enforces one per underlying.
+        # Never re-enter in the cycle that just exited: the notification would say
+        # SELL while silently opening a replacement at the exit price, and the user
+        # would meet that position for the first time as a HOLD next cycle. If the
+        # signal is still strong next cycle, it opens then.
+        if (
+            allow_open
+            and not exited
+            and should_open_position(conviction, signal)
+            and risk.is_valid
+        ):
+            db.open_position(
+                underlying=underlying,
+                opt_type=opt_type,
+                strike=strike,
+                expiry=expiry,
+                entry_spot=spot,
+                stop_loss=risk.stop_loss,
+                target=risk.target,
+                lot_size=lot_size,
+                conviction=conviction,
+                confidence=confidence,
+            )
+        return (
+            format_positions_for_notification(verdicts),
+            any(v.is_exit for v in verdicts),
+        )
+    except Exception as exc:
+        logger.error("Position management failed for %s: %s", underlying, exc)
+        return "", False
 
 
 # ── Next-session outlook (GIFT Nifty) ─────────────────────────────────────────
@@ -728,10 +865,28 @@ def _run_overnight_analysis() -> None:
 
 
 def _run_morning_report() -> None:
-    """Wrapper for the 8 AM morning report job."""
+    """Wrapper for the 8 AM morning report job.
+
+    Each section is delivered to both channels — Pushover and every Telegram
+    subscriber — so the morning brief lands the same places as the intraday
+    digests do.
+    """
     settings = get_settings()
+
+    def send(title: str, message: str, priority: int) -> None:
+        try:
+            PushoverNotifier(
+                user_key=settings.pushover_user_key,
+                api_token=settings.pushover_api_token,
+                enabled=settings.pushover_enabled,
+            ).send_text(title=title, message=message, priority=priority)
+        except Exception as exc:
+            logger.error("Morning report Pushover send failed: %s", exc)
+        # Quiet sections (news) arrive without a buzz on Telegram too.
+        _broadcast_telegram(title, message, silent=priority < 0)
+
     try:
-        run_morning_report(settings)
+        run_morning_report(settings, send=send)
     except Exception as exc:
         logger.error("Morning report crashed: %s", exc)
 
@@ -872,13 +1027,163 @@ def _stock_premium_lookup(token: str):
     return _lookup
 
 
-def _run_stock_scan() -> None:
-    """Scan the NIFTY 50 constituents for monthly-option ideas and send one digest."""
+def _run_bse_currency_scan(pre_open: bool = False) -> None:
+    """One digest of BSE Ltd stock options plus the four NSE currency pairs.
+
+    Both books sit outside the NIFTY-50 universe the stock scanner covers, so they
+    are scanned here and delivered together — one notification rather than two.
+    BSE Ltd resolves from NSE_FO; the pairs from NCD_FO.
+    """
+    settings = get_settings()
+    if pre_open:
+        if not _is_trading_weekday():
+            logger.info("BSE+currency scan: weekend — skipping.")
+            return
+    elif not _is_market_hours():
+        logger.info("BSE+currency scan: outside market hours — skipping.")
+        return
+
+    master = get_instrument_master()
+    risk_calculator = RiskCalculator(
+        max_risk_pct=settings.max_risk_per_trade_pct,
+        daily_loss_limit_pct=settings.daily_loss_limit_pct,
+        min_rr=settings.min_risk_reward_ratio,
+        atr_sl_multiplier=settings.atr_sl_multiplier,
+    )
+    lookup = _stock_premium_lookup(settings.upstox_access_token) or (lambda keys: {})
+    now = datetime.now(_IST).time()
+    empty = ScanResult(ideas=[], scanned=0, actionable=0, errors=0)
+
+    # ── BSE Ltd — an ordinary F&O stock, so the stock scanner handles it as-is ────
+    bse_result = empty
+    try:
+        histories, spots = fetch_stock_histories(
+            [_BSE_SYMBOL], interval=settings.data_interval,
+            upstox_token=settings.upstox_access_token, master=master,
+        )
+        if histories:
+            bse_result = scan_stocks(
+                histories, spots, master=master, risk_calculator=risk_calculator,
+                now=now, premium_lookup=lookup, default_iv=settings.stock_default_iv,
+                top_n=2,
+            )
+    except Exception as exc:
+        logger.error("BSE Ltd scan failed: %s", exc)
+
+    # ── Currency pairs — same stack, NCD_FO contracts ────────────────────────────
+    ccy_result = empty
+    try:
+        ccy_hist, ccy_spots = fetch_currency_histories(
+            settings.upstox_access_token, master, interval=settings.data_interval,
+        )
+        if ccy_hist:
+            ccy_result = scan_stocks(
+                ccy_hist, ccy_spots, master=master, risk_calculator=risk_calculator,
+                now=now, premium_lookup=lookup, default_iv=settings.currency_default_iv,
+                top_n=4, segment=SEGMENT_CURRENCY_FO,
+            )
+    except Exception as exc:
+        logger.error("Currency scan failed: %s", exc)
+
+    title, body = format_bse_currency_scan(bse_result, ccy_result)
+    if pre_open:
+        title = f"🌅 Pre-Open · {title}"
+    has_ideas = bool(bse_result.ideas or ccy_result.ideas)
+    priority = 0 if (has_ideas or pre_open) else -1
+
+    try:
+        PushoverNotifier(
+            user_key=settings.pushover_user_key,
+            api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
+        ).send_text(title=title, message=body, priority=priority, monospace=True)
+        logger.info(
+            "BSE+currency scan sent: %d BSE, %d currency ideas",
+            len(bse_result.ideas), len(ccy_result.ideas),
+        )
+    except Exception as exc:
+        logger.error("BSE+currency Pushover failed: %s", exc)
+
+    # A quiet scan still gets delivered, just without a buzz. Suppressing it
+    # entirely makes "nothing set up right now" and "the scan is broken" look
+    # identical from the phone — and on a book this thin, quiet is the normal case.
+    _broadcast_telegram(title, body, silent=not (has_ideas or pre_open))
+
+
+def _manage_stock_positions(settings, result, spots: dict[str, float]) -> tuple[str, bool]:
+    """Position management for the stock scan — the per-stock twin of _manage_positions.
+
+    Returns *(block, has_exit)*, matching _manage_positions.
+
+    A scan reports the top-N ideas only, so an underlying already being tracked may
+    not appear in this cycle's ideas at all. Open positions are therefore evaluated
+    against *spots* (every symbol the scan priced), not against the idea list, so a
+    tracked name that dropped out of the top-N is still managed rather than orphaned.
+    """
+    try:
+        db = DatabaseRepository(settings.database_url)
+        signal_by_symbol = {
+            i.symbol: (SignalType(i.signal), i) for i in result.ideas
+        }
+        verdicts = []
+        for position in db.list_open_positions():
+            spot = spots.get(f"{position.underlying}.NS", 0.0)
+            if spot <= 0:
+                continue  # index positions, or a name this scan could not price
+            signal, _ = signal_by_symbol.get(position.underlying, (None, None))
+            verdicts.append(evaluate_position(position, spot, signal))
+
+        exited: set[str] = set()
+        for v in verdicts:
+            if v.is_exit:
+                db.close_position(v.position.id, v.spot, v.reason)
+                exited.add(v.position.underlying)
+
+        for idea in result.ideas:
+            signal = SignalType(idea.signal)
+            # Same rule as the index path: a name that exited this cycle is not
+            # re-entered in the message that just told the user to sell it.
+            if idea.symbol in exited:
+                continue
+            if should_open_position(idea.conviction, signal):
+                db.open_position(
+                    underlying=idea.symbol,
+                    opt_type=idea.opt_type,
+                    strike=idea.strike,
+                    expiry=idea.expiry,
+                    entry_spot=idea.spot,
+                    stop_loss=idea.stop_loss,
+                    target=idea.target,
+                    entry_premium=idea.entry_premium,
+                    lot_size=idea.lot_size,
+                    conviction=idea.conviction,
+                    confidence=idea.confidence,
+                )
+        return (
+            format_positions_for_notification(verdicts),
+            any(v.is_exit for v in verdicts),
+        )
+    except Exception as exc:
+        logger.error("Stock position management failed: %s", exc)
+        return "", False
+
+
+def _run_stock_scan(pre_open: bool = False) -> None:
+    """Scan the NIFTY 50 constituents for monthly-option ideas and send one digest.
+
+    *pre_open* runs the scan before the 09:15 open (the 09:10 job): it swaps the
+    market-hours guard for a weekday guard — the ideas come from the prior session's
+    bars — and labels the notification accordingly. Mirrors _run_trade_plan.
+    """
     settings = get_settings()
     if not settings.stock_scan_enabled:
         logger.info("Stock scan disabled — skipping.")
         return
-    if not _is_market_hours():
+    if pre_open:
+        if not _is_trading_weekday():
+            logger.info("Pre-open stock scan: weekend — skipping.")
+            return
+    elif not _is_market_hours():
         logger.info("Stock scan: outside market hours — skipping.")
         return
 
@@ -906,6 +1211,17 @@ def _run_stock_scan() -> None:
     )
     lookup = _stock_premium_lookup(settings.upstox_access_token)
 
+    # Fundamentals are day-cached, so this is ~35s once and then free all session.
+    # Best-effort: a scan without event context is worse than one with it, but far
+    # better than no scan because yfinance was slow.
+    try:
+        fundamentals = fetch_fundamentals(
+            list(histories), news_limit=settings.stock_news_limit,
+        )
+    except Exception as exc:
+        logger.warning("Stock scan: fundamentals unavailable (%s) — continuing", exc)
+        fundamentals = {}
+
     result = scan_stocks(
         histories,
         spots,
@@ -915,15 +1231,25 @@ def _run_stock_scan() -> None:
         premium_lookup=lookup if lookup is not None else (lambda keys: {}),
         default_iv=settings.stock_default_iv,
         top_n=settings.stock_scan_top_n,
+        fundamentals=fundamentals,
+        earnings_blackout_days=settings.earnings_blackout_days,
     )
 
     # Keep only high-conviction ideas — the rest are dropped from the digest.
     result.ideas = [i for i in result.ideas if i.confidence >= settings.min_signal_confidence]
 
     title, body = format_stock_scan(result)
+    positions_block, position_exit = _manage_stock_positions(settings, result, spots)
+    body += positions_block
     # Running every 30 min, a "no setups" digest should not buzz the phone — only an
-    # actual CE/PE idea earns a sound; empty scans go out silent (priority -1).
-    priority = 0 if result.ideas else -1
+    # actual CE/PE idea earns a sound; empty scans go out silent (priority -1). An
+    # exit on a stock already held buzzes even when the scan found nothing new.
+    priority = 0 if (result.ideas or position_exit) else -1
+    if pre_open:
+        title = f"🌅 Pre-Open · {title}"
+        # The 09:10 scan is a scheduled briefing, not a poll — an empty result is
+        # still the answer the user asked for, so it goes out audibly either way.
+        priority = 0
     try:
         PushoverNotifier(
             user_key=settings.pushover_user_key,
@@ -937,9 +1263,12 @@ def _run_stock_scan() -> None:
     except Exception as exc:
         logger.error("Stock scan Pushover failed: %s", exc)
 
-    # Only broadcast an actual CE/PE digest to subscribers — skip empty scans.
-    if result.ideas:
-        _broadcast_telegram(title, body)
+    # Same rule as the BSE+currency scan: an empty scan is still delivered, just
+    # silently, so a quiet market is visibly quiet rather than looking like a
+    # dead job. Ideas, a pre-open briefing, or an exit all earn the buzz.
+    _broadcast_telegram(
+        title, body, silent=not (result.ideas or pre_open or position_exit),
+    )
 
 
 # ── Volatile-stock straddle scan (long-volatility CE+PE ideas) ──────────────────
@@ -1065,11 +1394,13 @@ def _run_telegram_bot() -> None:
     notifier = TelegramNotifier(token)
     repo = DatabaseRepository(settings.database_url)
     offset: int | None = None
+    consecutive_failures = 0
     logger.info("Telegram bot polling started")
 
     while True:
         try:
             for update in notifier.get_updates(offset=offset, timeout=25):
+                consecutive_failures = 0
                 offset = update["update_id"] + 1
                 result = handle_update(update, repo)
                 if result is None:
@@ -1081,9 +1412,20 @@ def _run_telegram_bot() -> None:
                     repo.deactivate_subscriber(chat_id)
                 except Exception as exc:
                     logger.warning("Telegram reply to %s failed: %s", chat_id, exc)
+            consecutive_failures = 0
         except Exception as exc:
-            logger.error("Telegram poll loop error: %s", exc)
-            time.sleep(5)
+            # Exponential backoff, capped. A persistent fault here is usually a
+            # second poller holding the same bot token (Telegram answers 409 to
+            # whichever asks second) or an outage — neither is helped by retrying
+            # at full speed, and both would otherwise fill the log at line rate.
+            consecutive_failures += 1
+            delay = min(_POLL_BACKOFF_BASE * 2 ** (consecutive_failures - 1), _POLL_BACKOFF_MAX)
+            log = logger.error if consecutive_failures <= _POLL_QUIET_AFTER else logger.debug
+            log(
+                "Telegram poll loop error (#%d, retrying in %ds): %s",
+                consecutive_failures, delay, exc,
+            )
+            time.sleep(delay)
 
 
 # ── Entry point ────────────────────────────────────────────────────────────────
@@ -1111,22 +1453,13 @@ def _allow_sleep() -> None:
     ctypes.windll.kernel32.SetThreadExecutionState(_ES_CONTINUOUS)
 
 
-def main() -> None:
-    global _token_monitor
+def _build_index_configs(settings) -> None:
+    """Populate the module-level _INDEX_CONFIGS for the indices we track.
 
-    configure_logging()
-    _prevent_sleep()
-    settings = get_settings()
-
-    _token_monitor = TokenMonitor(
-        notifier=PushoverNotifier(
-            user_key=settings.pushover_user_key,
-            api_token=settings.pushover_api_token,
-            enabled=settings.pushover_enabled,
-        )
-    )
-
-    # ── Build per-index configurations ──────────────────────────────────────────
+    Split out of main() so the scheduled jobs that read _INDEX_CONFIGS can be
+    exercised (and test-run) without starting the whole agent — an empty list
+    otherwise makes the trade plan silently produce no ideas at all.
+    """
     _INDEX_CONFIGS.clear()
     _INDEX_CONFIGS.extend([
         IndexConfig(
@@ -1171,6 +1504,24 @@ def main() -> None:
         ),
     ])
 
+
+def main() -> None:
+    global _token_monitor
+
+    configure_logging()
+    _prevent_sleep()
+    settings = get_settings()
+
+    _token_monitor = TokenMonitor(
+        notifier=PushoverNotifier(
+            user_key=settings.pushover_user_key,
+            api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
+        )
+    )
+
+    _build_index_configs(settings)
+
     logger.info(
         "NIFTY+SENSEX+BANKNIFTY AI Agent starting — morning report @ 08:00 IST | "
         "intraday signals every %d min | indices: %s",
@@ -1189,6 +1540,7 @@ def main() -> None:
             message=(
                 f"Tracking: {', '.join(c.name for c in _INDEX_CONFIGS)}\n"
                 f"Morning report @ 08:00 IST daily.\n"
+                f"Pre-open @ 09:10: overnight + index plan + stock plan.\n"
                 f"Signals every {settings.data_fetch_interval_minutes} min "
                 f"(09:15–15:30 IST)."
             ),
@@ -1211,8 +1563,15 @@ def main() -> None:
     schedule.every().day.at("17:00").do(_run_next_session_outlook)
     schedule.every().day.at("07:45").do(_run_overnight_analysis)
     schedule.every().day.at("08:00").do(_run_morning_report)
-    # Pre-open trade plan — 5 min before the 09:15 open, so the day's levels are ready.
+    # ── 09:10 pre-open briefing block ────────────────────────────────────────
+    # Three notifications, 5 min before the 09:15 open, on the freshest data of
+    # the morning: the overnight backdrop, then the index CE/PE plan, then the
+    # single-stock CE/PE plan. The 07:45 overnight run stays as the early read.
+    schedule.every().day.at("09:10").do(_run_overnight_analysis)
     schedule.every().day.at("09:10").do(_run_trade_plan, pre_open=True)
+    schedule.every().day.at("09:10").do(_run_stock_scan, pre_open=True)
+    if settings.bse_currency_scan_enabled:
+        schedule.every().day.at("09:10").do(_run_bse_currency_scan, pre_open=True)
     # Token health runs before the market opens (so a dead overnight token is caught
     # while there is still time to fix it) and hourly through the session.
     schedule.every().day.at("08:05").do(_check_token)
@@ -1225,6 +1584,16 @@ def main() -> None:
     if settings.stock_scan_enabled:
         schedule.every(settings.stock_scan_interval_minutes).minutes.do(_run_stock_scan)
         logger.info("Stock scan scheduled every %d min", settings.stock_scan_interval_minutes)
+
+    # BSE Ltd + NSE currency scan on a fixed interval (market-hours guarded).
+    if settings.bse_currency_scan_enabled:
+        schedule.every(settings.bse_currency_scan_interval_minutes).minutes.do(
+            _run_bse_currency_scan
+        )
+        logger.info(
+            "BSE+currency scan scheduled every %d min",
+            settings.bse_currency_scan_interval_minutes,
+        )
 
     # Volatile-stock straddle scan on a fixed interval (market-hours guarded).
     if settings.volatility_scan_enabled:
@@ -1243,6 +1612,7 @@ def main() -> None:
         _run_all_pipelines()
         _run_trade_plan()
         _run_stock_scan()
+        _run_bse_currency_scan()
         _run_volatility_scan()
     else:
         logger.info("Post-market start — running EOD prediction now.")
