@@ -12,7 +12,12 @@ _SIDE_ICON = {"BUY_CE": "📈", "BUY_PE": "📉"}
 
 
 def _idea_block(idea: StockIdea) -> list[str]:
-    """A two-line entry: the contract/price row, then the underlying trade levels."""
+    """Contract/price row, the underlying levels, then the premium to exit at.
+
+    The underlying target says where the stock has to go; the premium line says
+    what the option is worth when it gets there — which is the number an intraday
+    trade is actually closed on.
+    """
     est = "*" if not idea.is_live else ""
     contract = f"{idea.strike:g}{idea.opt_type}"
     header = row(
@@ -20,11 +25,16 @@ def _idea_block(idea: StockIdea) -> list[str]:
         [contract, premium(idea.entry_premium) + est, f"{idea.confidence}%"],
         label_width=11, cell_width=9,
     )
-    levels = (
+    lines = [
+        header,
         f"   {idea.spot:g} → tgt {idea.target:g} · SL {idea.stop_loss:g} "
-        f"(1:{idea.rr:g}, {idea.conviction.title()})"
-    )
-    return [header, levels]
+        f"(1:{idea.rr:g}, {idea.conviction.title()})",
+    ]
+    if idea.target_premium:
+        lines.append(
+            f"   sell ₹{premium(idea.target_premium)} · exit ₹{premium(idea.stop_premium)}"
+        )
+    return lines
 
 
 def format_stock_scan(result: ScanResult) -> tuple[str, str]:

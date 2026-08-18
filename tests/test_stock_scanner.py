@@ -35,22 +35,30 @@ def _trend_frame(start: float, end: float, periods: int = 120) -> pd.DataFrame:
 class FakeMaster:
     """Instrument master stub — returns a deterministic ATM contract per call."""
 
-    def __init__(self, lot_size: int = 250, raises: bool = False) -> None:
+    def __init__(
+        self, lot_size: int = 250, raises: bool = False, qty_multiplier: float = 1.0
+    ) -> None:
         self.lot_size = lot_size
         self.raises = raises
+        self.qty_multiplier = qty_multiplier
+        self.segments: list[str] = []   # records what the scanner asked for
 
-    def atm_contract(self, asset, spot, opt_type, allow_expiry_day=None):
+    def atm_contract(
+        self, asset, spot, opt_type, allow_expiry_day=None, segment="NSE_FO",
+    ):
         if self.raises:
             raise RuntimeError("master unavailable")
+        self.segments.append(segment)
         strike = round(spot / 10) * 10
         return OptionContract(
-            instrument_key=f"NSE_FO|{asset}",
+            instrument_key=f"{segment}|{asset}",
             trading_symbol=f"{asset}{strike}{opt_type}",
             asset_symbol=asset,
             strike=float(strike),
             opt_type=opt_type,
             expiry=date(2026, 8, 27),
             lot_size=self.lot_size,
+            qty_multiplier=self.qty_multiplier,
         )
 
 
@@ -347,3 +355,301 @@ class TestFetchStockHistories:
         assert _period_to_days("5d") == 5
         assert _period_to_days("10d") == 10
         assert _period_to_days("weird") == 5
+
+
+class TestPreOpenStockScan:
+    """The 09:10 pre-open job swaps the market-hours guard for a weekday guard."""
+
+    def _patched(self, monkeypatch, *, market_hours: bool, weekday: bool):
+        """Patch main's guards + fetch; return the fetch spy."""
+        import main
+
+        calls: list[str] = []
+        monkeypatch.setattr(main, "_is_market_hours", lambda: market_hours)
+        monkeypatch.setattr(main, "_is_trading_weekday", lambda: weekday)
+        monkeypatch.setattr(
+            main, "fetch_stock_histories",
+            lambda *a, **k: (calls.append("fetched"), ({}, {}))[1],
+        )
+        return main, calls
+
+    def test_pre_open_runs_outside_market_hours(self, monkeypatch):
+        main, calls = self._patched(monkeypatch, market_hours=False, weekday=True)
+        main._run_stock_scan(pre_open=True)
+        assert calls == ["fetched"]
+
+    def test_regular_scan_still_blocked_outside_market_hours(self, monkeypatch):
+        main, calls = self._patched(monkeypatch, market_hours=False, weekday=True)
+        main._run_stock_scan()
+        assert calls == []
+
+    def test_pre_open_skips_on_weekend(self, monkeypatch):
+        main, calls = self._patched(monkeypatch, market_hours=False, weekday=False)
+        main._run_stock_scan(pre_open=True)
+        assert calls == []
+
+
+class TestCurrencySegment:
+    """Currency options live in NCD_FO and size differently from equity F&O."""
+
+    def test_segment_is_passed_through_to_the_master(self):
+        master = FakeMaster(lot_size=1, qty_multiplier=1000.0)
+        res = scan_stocks(
+            {"USDINR": _trend_frame(85.0, 87.5)}, {"USDINR": 87.5},
+            master=master, risk_calculator=RiskCalculator(),
+            now=time(11, 0), segment="NCD_FO",
+        )
+        assert res.actionable == 1
+        assert master.segments == ["NCD_FO"]
+
+    def test_currency_contract_size_uses_qty_multiplier(self):
+        """lot_size=1 with qty_multiplier=1000 is a 1000-unit contract, not a 1-unit one."""
+        master = FakeMaster(lot_size=1, qty_multiplier=1000.0)
+        res = scan_stocks(
+            {"USDINR": _trend_frame(85.0, 87.5)}, {"USDINR": 87.5},
+            master=master, risk_calculator=RiskCalculator(),
+            now=time(11, 0), segment="NCD_FO",
+        )
+        assert res.ideas[0].lot_size == 1000
+
+    def test_equity_contract_size_is_unchanged(self):
+        master = FakeMaster(lot_size=200)   # qty_multiplier defaults to 1.0
+        res = scan_stocks(
+            {"BSE.NS": _trend_frame(3200.0, 3400.0)}, {"BSE.NS": 3400.0},
+            master=master, risk_calculator=RiskCalculator(), now=time(11, 0),
+        )
+        assert res.ideas[0].lot_size == 200
+        assert res.ideas[0].symbol == "BSE"   # .NS stripped
+        assert master.segments == ["NSE_FO"]
+
+
+class TestOptionContractSizing:
+    def test_contract_size_multiplies_lot_by_multiplier(self):
+        c = OptionContract(
+            instrument_key="NCD_FO|1", trading_symbol="USDINR 87.75 CE",
+            asset_symbol="USDINR", strike=87.75, opt_type="CE",
+            expiry=date(2026, 8, 27), lot_size=1, qty_multiplier=1000.0,
+        )
+        assert c.contract_size == 1000
+
+    def test_contract_size_defaults_to_lot_size(self):
+        c = OptionContract(
+            instrument_key="NSE_FO|1", trading_symbol="BSE 3400 CE",
+            asset_symbol="BSE", strike=3400.0, opt_type="CE",
+            expiry=date(2026, 8, 27), lot_size=200,
+        )
+        assert c.contract_size == 200
+
+
+class TestPremiumProjection:
+    """The exit price an intraday option trade is actually closed on."""
+
+    def _idea(self, frames_from, frames_to, spot, premium=20.0):
+        res = scan_stocks(
+            {"RELIANCE.NS": _trend_frame(frames_from, frames_to)},
+            {"RELIANCE.NS": spot},
+            master=FakeMaster(), risk_calculator=RiskCalculator(max_risk_pct=5.0),
+            now=time(11, 0), premium_lookup=_live_lookup(premium),
+        )
+        assert res.ideas, "expected an actionable idea"
+        return res.ideas[0]
+
+    def test_call_gains_when_the_underlying_reaches_target(self):
+        idea = self._idea(100, 130, 130.0)
+        assert idea.signal == "BUY_CE"
+        assert idea.target_premium > idea.entry_premium
+        assert idea.stop_premium < idea.entry_premium
+
+    def test_put_gains_when_the_underlying_falls_to_target(self):
+        """A put must gain on a DOWN move — the sign trap for projections."""
+        idea = self._idea(130, 100, 100.0)
+        assert idea.signal == "BUY_PE"
+        assert idea.target_premium > idea.entry_premium
+        assert idea.stop_premium < idea.entry_premium
+
+    def test_projection_is_bounded_by_the_underlying_move(self):
+        """Delta <= 1, so an option cannot gain more than the underlying did."""
+        idea = self._idea(100, 130, 130.0)
+        underlying_move = abs(idea.target - idea.spot)
+        assert (idea.target_premium - idea.entry_premium) < underlying_move
+
+    def test_premium_never_goes_negative(self):
+        idea = self._idea(100, 130, 130.0, premium=0.10)
+        assert idea.stop_premium > 0
+
+    def test_invalid_risk_yields_no_projection(self):
+        """A rejected risk calc has no levels to project to — render blank, not Rs 0."""
+        from nifty_ai_agent.strategies.stock_scanner import _project_premiums
+
+        class _Risk:
+            is_valid = False
+            target = 0.0
+            stop_loss = 0.0
+
+        contract = OptionContract(
+            instrument_key="NSE_FO|X", trading_symbol="X", asset_symbol="X",
+            strike=100.0, opt_type="CE", expiry=date(2026, 8, 27), lot_size=100,
+        )
+        assert _project_premiums(
+            20.0, 100.0, _Risk(), contract, "27-Aug-2026", "CE", 0.30,
+        ) == (0.0, 0.0)
+
+
+class TestStockScanReportPremiums:
+    def test_sell_and_exit_lines_are_rendered(self):
+        res = scan_stocks(
+            {"RELIANCE.NS": _trend_frame(100, 130)}, {"RELIANCE.NS": 130.0},
+            master=FakeMaster(), risk_calculator=RiskCalculator(max_risk_pct=5.0),
+            now=time(11, 0), premium_lookup=_live_lookup(20.0),
+        )
+        _, body = format_stock_scan(res)
+        assert "sell ₹" in body and "exit ₹" in body
+
+    def test_line_omitted_when_there_is_no_projection(self):
+        idea = StockIdea(
+            symbol="X", signal="BUY_CE", confidence=70, conviction="STRONG",
+            opt_type="CE", strike=100.0, expiry="27-Aug-2026", lot_size=100,
+            entry_premium=20.0, is_live=True, spot=100.0,
+            target=0.0, stop_loss=0.0, rr=0.0,
+        )
+        _, body = format_stock_scan(
+            ScanResult(ideas=[idea], scanned=1, actionable=1, errors=0)
+        )
+        assert "sell ₹" not in body
+
+
+class TestEarningsBlackout:
+    """Long premium into a results print is a different trade; the chart can't see it."""
+
+    @staticmethod
+    def _fund(days_away):
+        from datetime import date, timedelta
+        from nifty_ai_agent.data.fundamentals import StockFundamentals
+        return StockFundamentals(
+            symbol="RELIANCE",
+            next_earnings=(date.today() + timedelta(days=days_away)).isoformat(),
+        )
+
+    def _scan(self, days_away, blackout=3):
+        return scan_stocks(
+            {"RELIANCE.NS": _trend_frame(100, 130)}, {"RELIANCE.NS": 130.0},
+            master=FakeMaster(), risk_calculator=RiskCalculator(max_risk_pct=5.0),
+            now=time(11, 0), premium_lookup=_live_lookup(20.0),
+            fundamentals={"RELIANCE": self._fund(days_away)},
+            earnings_blackout_days=blackout,
+        )
+
+    def test_entry_blocked_inside_the_window(self):
+        res = self._scan(days_away=2)
+        assert res.ideas == []
+        assert res.holds and "results in 2d" in res.holds[0].reason
+
+    def test_results_today_is_blocked(self):
+        res = self._scan(days_away=0)
+        assert res.ideas == []
+        assert "results today" in res.holds[0].reason
+
+    def test_entry_allowed_outside_the_window(self):
+        res = self._scan(days_away=30)
+        assert len(res.ideas) == 1
+        assert res.holds == []
+
+    def test_boundary_day_is_blocked(self):
+        assert self._scan(days_away=3, blackout=3).ideas == []
+        assert len(self._scan(days_away=4, blackout=3).ideas) == 1
+
+    def test_guard_disabled_by_zero(self):
+        assert len(self._scan(days_away=1, blackout=0).ideas) == 1
+
+    def test_unknown_earnings_date_does_not_block(self):
+        """No date must mean 'no known event', never 'assume the worst and freeze'."""
+        from nifty_ai_agent.data.fundamentals import StockFundamentals
+        res = scan_stocks(
+            {"RELIANCE.NS": _trend_frame(100, 130)}, {"RELIANCE.NS": 130.0},
+            master=FakeMaster(), risk_calculator=RiskCalculator(max_risk_pct=5.0),
+            now=time(11, 0), premium_lookup=_live_lookup(20.0),
+            fundamentals={"RELIANCE": StockFundamentals(symbol="RELIANCE")},
+            earnings_blackout_days=3,
+        )
+        assert len(res.ideas) == 1
+
+    def test_no_fundamentals_at_all_does_not_block(self):
+        res = scan_stocks(
+            {"RELIANCE.NS": _trend_frame(100, 130)}, {"RELIANCE.NS": 130.0},
+            master=FakeMaster(), risk_calculator=RiskCalculator(max_risk_pct=5.0),
+            now=time(11, 0), premium_lookup=_live_lookup(20.0),
+            earnings_blackout_days=3,
+        )
+        assert len(res.ideas) == 1
+
+
+class TestSymbolResolution:
+    """A ticker retired by a corporate action must not silently become a 404."""
+
+    @staticmethod
+    def _master(rows):
+        from nifty_ai_agent.data.instrument_master import InstrumentMaster
+        m = InstrumentMaster()
+        m._rows = rows
+        return m
+
+    @staticmethod
+    def _eq(symbol, name, key=None):
+        return {"segment": "NSE_EQ", "trading_symbol": symbol, "name": name,
+                "instrument_key": key or f"NSE_EQ|{symbol}"}
+
+    def _rows(self):
+        return [
+            self._eq("TMPV", "TATA MOTORS PASS VEH LTD"),
+            self._eq("TMCV", "TATA MOTORS LIMITED"),
+            self._eq("RELIANCE", "RELIANCE INDUSTRIES LTD"),
+            self._eq("TATAPOWER", "TATA POWER CO LTD"),
+        ]
+
+    def test_exact_symbol_resolves(self):
+        m = self._master(self._rows())
+        match = m.resolve_equity("RELIANCE")
+        assert match.trading_symbol == "RELIANCE" and match.is_exact
+
+    def test_retired_symbol_follows_the_rename(self):
+        m = self._master(self._rows())
+        match = m.resolve_equity("TATAMOTORS")
+        assert match.trading_symbol == "TMPV"
+        assert not match.is_exact
+        assert match.requested == "TATAMOTORS"
+
+    def test_equity_key_uses_the_successor(self):
+        m = self._master(self._rows())
+        assert m.equity_key("TATAMOTORS") == "NSE_EQ|TMPV"
+
+    def test_lowercase_input_resolves(self):
+        assert self._master(self._rows()).resolve_equity("reliance").trading_symbol == "RELIANCE"
+
+    def test_unknown_symbol_returns_none(self):
+        assert self._master(self._rows()).resolve_equity("NOSUCHCO") is None
+
+    def test_resolution_never_guesses_by_similarity(self):
+        """Substituting a merely similar company into a scan would trade the wrong business."""
+        assert self._master(self._rows()).resolve_equity("TATAPOWR") is None
+
+    def test_suggestions_rank_the_intended_name_first(self):
+        m = self._master(self._rows())
+        assert m.suggest_symbols("RELAINCE")[0][0] == "RELIANCE"
+
+    def test_suggestions_match_on_company_name(self):
+        m = self._master(self._rows())
+        found = [s for s, _ in m.suggest_symbols("TATA MOTORS")]
+        assert "TMPV" in found and "TMCV" in found
+
+    def test_no_suggestions_for_nonsense(self):
+        assert self._master(self._rows()).suggest_symbols("ZZZZQQ") == []
+
+
+class TestUniverseIsCurrent:
+    def test_no_retired_tickers_in_the_scan_universe(self):
+        from nifty_ai_agent.data.instrument_master import RENAMED_SYMBOLS
+        from nifty_ai_agent.data.nifty50_stocks import NIFTY50_SYMBOLS
+
+        bare = {s[:-3] if s.endswith(".NS") else s for s in NIFTY50_SYMBOLS}
+        stale = bare & set(RENAMED_SYMBOLS)
+        assert not stale, f"universe still lists retired tickers: {sorted(stale)}"
