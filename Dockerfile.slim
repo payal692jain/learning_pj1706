@@ -1,0 +1,48 @@
+# Slim image for free-tier cloud hosting.
+#
+# Differs from the main Dockerfile in one way: no Playwright/Chromium. That saves
+# roughly 400 MB of image and another ~400 MB of RSS whenever the browser launches
+# — the difference between fitting a free 1 GB VM and being OOM-killed by it.
+#
+# What is lost: the NSE option-chain browser fallback, used only when Akamai
+# blocks the plain HTTP path. The chain is fetched from Upstox first, and if both
+# fail the code already degrades to a VIX-based synthetic chain rather than
+# failing, so the cost is a slightly less precise chain on NSE's bad days.
+#
+#   docker build -f Dockerfile.slim -t nifty-agent:slim .
+#
+# Timezone is pinned to Asia/Kolkata because the scheduler's fixed-time jobs
+# (schedule.every().day.at("09:10")) fire on the container's LOCAL wall clock.
+FROM python:3.12-slim
+
+ENV PYTHONUNBUFFERED=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    TZ=Asia/Kolkata
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends tzdata \
+    && ln -snf /usr/share/zoneinfo/$TZ /etc/localtime \
+    && echo $TZ > /etc/timezone \
+    && rm -rf /var/lib/apt/lists/*
+
+WORKDIR /app
+
+# Four things main.py never imports are filtered out here:
+#   playwright  — the NSE browser fallback (see header)
+#   streamlit   — only dashboard/app.py uses it; pulls a large dependency tree
+#   plotly      — same, dashboard only
+#   pytest*     — a deploy image has no reason to carry the test runner
+#
+# Filtering rather than keeping a second requirements file means requirements.txt
+# stays the single source of truth and cannot silently drift out of sync.
+COPY requirements.txt .
+RUN grep -viE '^\s*(playwright|streamlit|plotly|pytest|pytest-cov)\b' requirements.txt \
+        > requirements.slim.txt \
+    && pip install --no-cache-dir -r requirements.slim.txt
+
+COPY . .
+
+# FileHandler in configure_logging() does not create parent dirs — ensure it exists.
+RUN mkdir -p nifty_ai_agent/logs nifty_ai_agent/cache
+
+CMD ["python", "main.py"]

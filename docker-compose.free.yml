@@ -1,0 +1,43 @@
+# Free-tier deployment: the agent alone, on SQLite, no Postgres.
+#
+#   docker compose -f docker-compose.free.yml up -d --build
+#   docker compose -f docker-compose.free.yml logs -f agent
+#
+# Two differences from docker-compose.yml, both to fit a free VM:
+#
+#   1. No Postgres service. SQLite in a mounted volume saves ~150 MB of RSS and
+#      one container. A single-writer agent has no need for a client/server DB.
+#   2. Dockerfile.slim (no Playwright/Chromium), saving ~400 MB image and a
+#      ~400 MB spike whenever the browser would have launched.
+#
+# The instrument master alone holds ~148 MB in memory, so budget ~700 MB for the
+# agent at peak. That fits Oracle's Ampere A1 (24 GB) comfortably and a 1 GB
+# micro instance only barely — set the memory limit below to find out early
+# rather than via a silent OOM kill mid-session.
+
+services:
+  agent:
+    build:
+      context: .
+      dockerfile: Dockerfile.slim
+    env_file: .env
+    environment:
+      # Override whatever .env says: the DB must live on the mounted volume, or
+      # every container rebuild silently discards the position history the
+      # scorecard is computed from.
+      DATABASE_URL: sqlite:////data/nifty_ai_agent.db
+      TZ: Asia/Kolkata
+    volumes:
+      - agentdata:/data
+      # Cache survives restarts: the instrument master is a 42 MB download and
+      # the fundamentals cache is ~35s of yfinance calls.
+      - agentcache:/app/nifty_ai_agent/cache
+      - agentlogs:/app/nifty_ai_agent/logs
+    restart: unless-stopped
+    # Uncomment on a 1 GB box to fail loudly instead of being OOM-killed silently:
+    # mem_limit: 900m
+
+volumes:
+  agentdata:
+  agentcache:
+  agentlogs:
