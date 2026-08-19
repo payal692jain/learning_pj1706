@@ -57,6 +57,11 @@ _TOKEN_RE = re.compile(r"[a-z]+")
 _VIX_ELEVATED = 18.0
 _VIX_HIGH = 22.0
 
+# Crude drifts +/-1% on nothing; below this it is noise, not a macro input.
+# Kept in step with market_context._CRUDE_MATERIAL_PCT so the confidence
+# adjustment and the morning report call the same move material.
+_CRUDE_MATERIAL_PCT = 1.5
+
 
 @dataclass
 class NewsSentiment:
@@ -85,6 +90,19 @@ class GlobalSnapshot:
     news: NewsSentiment = field(
         default_factory=lambda: NewsSentiment(0.0, 0, 0, 0)
     )
+    # Scored separately as well as combined: for an Indian index, a domestic
+    # headline is worth more than a US one, and averaging them together loses
+    # exactly that distinction.
+    india_news: NewsSentiment = field(
+        default_factory=lambda: NewsSentiment(0.0, 0, 0, 0)
+    )
+    world_news: NewsSentiment = field(
+        default_factory=lambda: NewsSentiment(0.0, 0, 0, 0)
+    )
+    # Percent change in crude. Stored raw; the sign is inverted where it is USED,
+    # not here, so the number still reads the way a price quote does.
+    crude_pct: float = 0.0
+    crude_name: str = ""
     is_available: bool = False        # False when every upstream fetch failed
 
     @property
@@ -147,12 +165,18 @@ def analyse_news(items: list[NewsItem]) -> NewsSentiment:
 def build_snapshot(context: MarketContext, items: list[NewsItem]) -> GlobalSnapshot:
     """Fold a MarketContext and a headline list into one GlobalSnapshot."""
     vix = next((i for i in context.indices if i.name == "India VIX"), None)
+    india, world = split_sentiment(items)
+    crude = context.crude
     return GlobalSnapshot(
         global_bias=context.global_bias,
         gift_nifty_pct=context.gift_nifty.change_pct if context.gift_nifty else 0.0,
         vix=vix.price if vix else 0.0,
         vix_change_pct=vix.change_pct if vix else 0.0,
         news=analyse_news(items),
+        india_news=india,
+        world_news=world,
+        crude_pct=crude.change_pct if crude else 0.0,
+        crude_name=crude.name if crude else "",
         is_available=bool(context.indices or items),
     )
 
@@ -187,9 +211,10 @@ def fetch_global_snapshot(force: bool = False) -> GlobalSnapshot:
     _cache["snapshot"] = snapshot
     _cache["fetched_at"] = now
     logger.info(
-        "Global context: bias=%s GIFT=%+.2f%% VIX=%.1f (%s) news=%s",
+        "Global context: bias=%s GIFT=%+.2f%% VIX=%.1f (%s) news IN=%s/WORLD=%s crude=%+.2f%%",
         snapshot.global_bias, snapshot.gift_nifty_pct, snapshot.vix,
-        snapshot.vix_regime, snapshot.news.label,
+        snapshot.vix_regime, snapshot.india_news.label, snapshot.world_news.label,
+        snapshot.crude_pct,
     )
     return snapshot
 
@@ -235,12 +260,43 @@ def global_confidence_adjustment(
         delta += 4 if agrees else -6
         notes.append(f"GIFT Nifty {snapshot.gift_nifty_pct:+.2f}%.")
 
-    # ── News sentiment ──
-    if snapshot.news.label != "NEUTRAL":
+    # ── News sentiment, by region ──
+    # Indian headlines outweigh world ones for an Indian index: a Nifty-specific
+    # story bears on this trade more directly than a US one, and folding them into
+    # a single score loses that. Falls back to the combined read when the region
+    # split is empty (a caller that built the snapshot the old way).
+    regional = [
+        ("India", snapshot.india_news, 4, -6),
+        ("World", snapshot.world_news, 2, -3),
+    ]
+    scored_regionally = False
+    for region, sentiment, up, down in regional:
+        if not sentiment.headlines or sentiment.label == "NEUTRAL":
+            continue
+        scored_regionally = True
+        agrees = (sentiment.label == "BULLISH") == bullish_signal
+        delta += up if agrees else down
+        verb = "supports" if agrees else "contradicts"
+        notes.append(f"{region} headlines {sentiment.label.lower()} — {verb} the trade.")
+
+    if not scored_regionally and snapshot.news.label != "NEUTRAL":
         agrees = (snapshot.news.label == "BULLISH") == bullish_signal
         delta += 3 if agrees else -5
         verb = "supports" if agrees else "contradicts"
         notes.append(f"Headlines skew {snapshot.news.label.lower()} — {verb} the trade.")
+
+    # ── Crude — sign INVERTED for India ──
+    # India imports ~85% of its crude, so a rally is a headwind: it widens the
+    # import bill, pressures the rupee and feeds inflation. Rising oil therefore
+    # OPPOSES a BUY_CE, which is the reverse of how every other input here reads.
+    # Only material moves count; crude drifts ±1% on nothing.
+    if abs(snapshot.crude_pct) >= _CRUDE_MATERIAL_PCT:
+        crude_is_bullish_for_india = snapshot.crude_pct < 0
+        agrees = crude_is_bullish_for_india == bullish_signal
+        delta += 3 if agrees else -5
+        label = snapshot.crude_name or "Crude"
+        effect = "tailwind" if crude_is_bullish_for_india else "headwind"
+        notes.append(f"{label} {snapshot.crude_pct:+.1f}% is a {effect} for India.")
 
     # ── India VIX — direction-agnostic, hits option buyers either way ──
     regime = snapshot.vix_regime
