@@ -156,6 +156,7 @@ def backtest_symbol(
     now: dt_time = dt_time(11, 0),
     one_trade_at_a_time: bool = True,
     lookback: int = 200,
+    htf_rule: str | None = None,
 ) -> BacktestResult:
     """Replay *hist* bar by bar and score every entry the stack would have taken.
 
@@ -169,6 +170,12 @@ def backtest_symbol(
     it, OpeningRangeBreakout's per-call `df.index.date` scan over an ever-growing
     slice makes the whole run quadratic. 200 bars comfortably covers a full
     5-minute session (75 bars) plus every strategy's lookback.
+
+    *htf_rule* ("30min", "60min") adds a higher-timeframe filter: an entry is
+    only taken when the slower timeframe agrees with it. The higher-timeframe
+    consensus is computed once per slow bar and then matched to each fast bar by
+    the *previous* slow close — using the slow bar the fast bar sits inside would
+    read a candle that has not finished forming, which is look-ahead.
     """
     strategies = strategies or DEFAULT_STRATEGIES
     result = BacktestResult()
@@ -184,6 +191,8 @@ def backtest_symbol(
     )
     floor = _CONVICTION_RANK.get(min_conviction.upper(), 1)
     busy_until = -1
+
+    htf_signal = _htf_series(df, htf_rule, strategies, now) if htf_rule else None
 
     for i in range(warmup, len(df) - 1):
         result.bars_tested += 1
@@ -209,6 +218,10 @@ def backtest_symbol(
             continue
         if consensus.confidence < min_confidence:
             continue
+        if htf_signal is not None:
+            slow = htf_signal.get(df.index[i])
+            if slow is None or slow is not consensus.signal:
+                continue
 
         entry = float(df["close"].iloc[i])
         params = risk.calculate(consensus.signal, entry, float(df["atr"].iloc[i]))
@@ -229,6 +242,51 @@ def backtest_symbol(
         busy_until = trade.exit_index
 
     return result
+
+
+def _htf_series(
+    df: pd.DataFrame, rule: str, strategies: list[BaseStrategy], now: dt_time,
+) -> dict:
+    """Map every fast-bar timestamp to the higher timeframe's signal at that moment.
+
+    The slow bar a fast bar sits *inside* has not closed yet, so using it would
+    let the backtest see the rest of that candle. Each fast bar is therefore
+    matched to the last slow bar that had already closed — the same information a
+    live run would have had.
+    """
+    from nifty_ai_agent.strategies.multi_timeframe import resample_ohlcv
+
+    slow = compute_all_indicators(
+        resample_ohlcv(df[["open", "high", "low", "close", "volume"]], rule.replace("min", "m"))
+    )
+    if len(slow) < 60:
+        return {}
+
+    decided: list[tuple] = []
+    for j in range(50, len(slow)):
+        window = slow.iloc[max(0, j - 200): j + 1]
+        if window[_REQUIRED].iloc[-1].isna().any():
+            continue
+        try:
+            signals = [s.generate_signal(window) for s in strategies]
+            decided.append((slow.index[j], build_consensus(
+                signals, now=now, intraday=False).signal))
+        except Exception:
+            continue
+
+    if not decided:
+        return {}
+
+    stamps = [t for t, _ in decided]
+    lookup: dict = {}
+    cursor = -1
+    for ts in df.index:
+        # Advance only past slow bars that CLOSED strictly before this fast bar.
+        while cursor + 1 < len(stamps) and stamps[cursor + 1] < ts:
+            cursor += 1
+        if cursor >= 0:
+            lookup[ts] = decided[cursor][1]
+    return lookup
 
 
 def backtest_universe(

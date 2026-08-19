@@ -64,7 +64,14 @@ class Settings(BaseSettings):
         default=5, description="How often to run the signal loop"
     )
     historical_days: int = Field(
-        default=10, description="Days of OHLC history to fetch (5m bars: 10d = ~750 candles)"
+        default=30,
+        description=(
+            "Days of OHLC history to fetch. Must be enough for the SLOWEST "
+            "timeframe read, not just the base bars: at 10 days a 5-minute fetch "
+            "resamples to only ~46 hourly bars, below the 60 needed for EMA50, so "
+            "the 60m trend filter silently reported 'no read' and confirmed "
+            "nothing. 30 days yields ~150 hourly bars"
+        ),
     )
     data_interval: str = Field(
         default="5m",
@@ -98,6 +105,40 @@ class Settings(BaseSettings):
             "intraday trade call (including the EOD prediction), the trade plan, and "
             "the stock scan — lower-conviction signals are still recorded, just not "
             "pushed. 0 (default) notifies on every actionable signal, no filtering."
+        ),
+    )
+
+    compact_notifications: bool = Field(
+        default=True,
+        description=(
+            "Trim HOLD heartbeats to the decision alone, dropping the strategy "
+            "vote table, global cues and bank-constituent ideas. Actionable "
+            "messages — a BUY, or a SELL on an open position — always keep the "
+            "full detail regardless, because those are the ones you might trade "
+            "from. Set false to send everything in full"
+        ),
+    )
+    notify_interval_minutes: int = Field(
+        default=15,
+        description=(
+            "Minimum minutes between ROUTINE index signal notifications. The "
+            "pipeline still runs every data_fetch_interval_minutes so it sees "
+            "the market at full speed — this only governs how often an "
+            "unchanged read is repeated. Sudden changes bypass it entirely"
+        ),
+    )
+    notify_on_move_pct: float = Field(
+        default=0.35,
+        description=(
+            "Percent the index must travel since the LAST alert to force an "
+            "immediate notification, regardless of the interval"
+        ),
+    )
+    notify_on_confidence_jump: int = Field(
+        default=15,
+        description=(
+            "Confidence points, up or down, that force an immediate "
+            "notification regardless of the interval"
         ),
     )
 
@@ -165,8 +206,29 @@ class Settings(BaseSettings):
             "Set 0 to disable the guard"
         ),
     )
+    stock_trend_timeframe: str = Field(
+        default="60m",
+        description=(
+            "Slower timeframe a single-stock entry must agree with before it "
+            "becomes actionable. Backtested over 12 symbols, 30m entries alone "
+            "returned +0.021% expectancy and 30m confirmed by 60m returned "
+            "+0.031% on about half the trades. Empty string disables the filter"
+        ),
+    )
     stock_news_limit: int = Field(
         default=4, description="Headlines fetched per stock for event detection"
+    )
+
+    # ── Top gainers / losers digest ─────────────────────────────
+    movers_enabled: bool = Field(
+        default=True,
+        description="Send a top gainers/losers digest across the F&O universe",
+    )
+    movers_interval_minutes: int = Field(
+        default=60, description="Minutes between gainers/losers digests"
+    )
+    movers_top_n: int = Field(
+        default=10, description="How many gainers and losers to list"
     )
 
     # ── BSE Ltd + NSE currency scan ─────────────────────────────

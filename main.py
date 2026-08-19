@@ -46,6 +46,7 @@ from nifty_ai_agent.data.instrument_master import (
 from nifty_ai_agent.data.nifty50_stocks import NIFTY50_SYMBOLS
 from nifty_ai_agent.data.currency import fetch_currency_histories
 from nifty_ai_agent.data.fundamentals import fetch_fundamentals
+from nifty_ai_agent.data.market_movers import fetch_market_movers
 from nifty_ai_agent.data.stock_data import fetch_stock_histories
 from nifty_ai_agent.data.token_health import TokenMonitor
 from nifty_ai_agent.data.breadth import BreadthSnapshot, fetch_realtime_breadth
@@ -59,10 +60,12 @@ from nifty_ai_agent.positions import (
     should_open_position,
 )
 from nifty_ai_agent.notifier.pushover import PushoverNotifier
+from nifty_ai_agent.notifier.throttle import NotificationThrottle
 from nifty_ai_agent.reports.morning_report import run_morning_report
 from nifty_ai_agent.reports.next_session import format_next_session
 from nifty_ai_agent.reports.trade_call import format_trade_call
 from nifty_ai_agent.reports.bse_currency import format_bse_currency_scan
+from nifty_ai_agent.reports.movers import format_movers
 from nifty_ai_agent.reports.stock_scan import format_stock_scan
 from nifty_ai_agent.reports.volatility_scan import format_volatility_scan
 from nifty_ai_agent.reports.trade_plan import (
@@ -99,6 +102,11 @@ _IST = pytz.timezone("Asia/Kolkata")
 # BSE Ltd (the exchange company) — an ordinary NSE-listed F&O stock, ticker "BSE".
 # Not a NIFTY 50 constituent, so the stock scanner's universe never reaches it.
 _BSE_SYMBOL = "BSE.NS"
+
+# Per-index notification gate. Module-level so it survives across scheduler
+# ticks — a throttle rebuilt each cycle would remember nothing and suppress
+# nothing.
+_NOTIFY_THROTTLE = NotificationThrottle()
 
 # Telegram long-poll backoff: 5s, 10s, 20s … capped at a minute. After a few
 # failures the log drops to debug so a long outage leaves a trace without
@@ -590,6 +598,10 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
         return
     silent = not consensus.is_actionable
 
+    # A BUY, or a SELL on something already held, is a message you might trade
+    # from; everything else is a heartbeat. This decides how much detail it earns.
+    actionable_message = consensus.is_actionable or position_exit
+
     # ── Pushover — the call, not the research dump ────────────────────────────────
     margin_calculator = MarginCalculator(
         capital=settings.trading_capital,
@@ -617,6 +629,12 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
             global_snapshot=global_snapshot,
             bank_ideas=bank_ideas,
             prediction=after_hours,
+            # Detail is earned by actionability. A BUY, or a SELL on something
+            # already held, is a moment you might act on — that is when the
+            # strategy vote and the global cues are worth having. A HOLD
+            # heartbeat is not, and padding it out is how the useful messages
+            # get lost among the routine ones.
+            compact=settings.compact_notifications and not actionable_message,
         )
         if ai_explanation:
             body = f"{body}\n\n{ai_explanation}"[: 1024]
@@ -628,6 +646,33 @@ def run_pipeline(index: IndexConfig, after_hours: bool = False) -> None:
     # arriving on a HOLD cycle would go out as a silent heartbeat and be missed.
     if position_exit:
         silent = False
+
+    # ── Notification throttle ────────────────────────────────────────────────
+    # The loop runs every 5 minutes because that is how fast it must SEE the
+    # market; it is not how often anyone wants to hear from it. Routine updates
+    # go out on a slower clock, while a flip, a conviction upgrade, a confidence
+    # jump, a sharp move, or a position exit all jump the queue immediately.
+    # An after-hours prediction is a one-off, not part of the intraday stream.
+    if not after_hours:
+        decision = _NOTIFY_THROTTLE.evaluate(
+            index.name,
+            signal=consensus.signal.value,
+            conviction=consensus.conviction,
+            confidence=consensus.confidence,
+            spot=spot.price,
+            force=position_exit,
+        )
+        if not decision.send:
+            logger.info(
+                "%s: %s %d%% unchanged — not notified (throttled to %d min).",
+                index.name, consensus.signal.value, consensus.confidence,
+                settings.notify_interval_minutes,
+            )
+            return
+        if decision.is_urgent:
+            title = f"⚡ {title}"
+            body = f"{body}\n\n⚡ {decision.reason}"
+            silent = False
 
     try:
         PushoverNotifier(
@@ -1027,6 +1072,47 @@ def _stock_premium_lookup(token: str):
     return _lookup
 
 
+def _run_movers_digest() -> None:
+    """Top gainers and losers across the NSE F&O universe.
+
+    Market-hours guarded: a movers list outside the session is yesterday's news,
+    and the whole value of this digest is that it is current.
+    """
+    settings = get_settings()
+    if not settings.movers_enabled:
+        return
+    if not _is_market_hours():
+        logger.info("Movers digest: outside market hours — skipping.")
+        return
+
+    try:
+        snapshot = fetch_market_movers(
+            settings.upstox_access_token, get_instrument_master(),
+            top_n=settings.movers_top_n,
+        )
+    except Exception as exc:
+        logger.error("Movers digest failed: %s", exc)
+        return
+
+    title, body = format_movers(snapshot, top_n=settings.movers_top_n)
+    has_data = bool(snapshot.gainers or snapshot.losers)
+    try:
+        PushoverNotifier(
+            user_key=settings.pushover_user_key,
+            api_token=settings.pushover_api_token,
+            enabled=settings.pushover_enabled,
+        ).send_text(title=title, message=body,
+                    priority=0 if has_data else -1, monospace=True)
+        logger.info(
+            "Movers digest sent: %d scanned, %d↑ / %d↓",
+            snapshot.scanned, snapshot.advances, snapshot.declines,
+        )
+    except Exception as exc:
+        logger.error("Movers Pushover failed: %s", exc)
+
+    _broadcast_telegram(title, body, silent=not has_data)
+
+
 def _run_bse_currency_scan(pre_open: bool = False) -> None:
     """One digest of BSE Ltd stock options plus the four NSE currency pairs.
 
@@ -1233,6 +1319,7 @@ def _run_stock_scan(pre_open: bool = False) -> None:
         top_n=settings.stock_scan_top_n,
         fundamentals=fundamentals,
         earnings_blackout_days=settings.earnings_blackout_days,
+        trend_tf=settings.stock_trend_timeframe,
     )
 
     # Keep only high-conviction ideas — the rest are dropped from the digest.
@@ -1520,6 +1607,10 @@ def main() -> None:
         )
     )
 
+    _NOTIFY_THROTTLE.interval_minutes = settings.notify_interval_minutes
+    _NOTIFY_THROTTLE.move_pct = settings.notify_on_move_pct
+    _NOTIFY_THROTTLE.confidence_jump = settings.notify_on_confidence_jump
+
     _build_index_configs(settings)
 
     logger.info(
@@ -1585,6 +1676,13 @@ def main() -> None:
         schedule.every(settings.stock_scan_interval_minutes).minutes.do(_run_stock_scan)
         logger.info("Stock scan scheduled every %d min", settings.stock_scan_interval_minutes)
 
+    # Top gainers/losers across the F&O universe (market-hours guarded).
+    if settings.movers_enabled:
+        schedule.every(settings.movers_interval_minutes).minutes.do(_run_movers_digest)
+        logger.info(
+            "Movers digest scheduled every %d min", settings.movers_interval_minutes,
+        )
+
     # BSE Ltd + NSE currency scan on a fixed interval (market-hours guarded).
     if settings.bse_currency_scan_enabled:
         schedule.every(settings.bse_currency_scan_interval_minutes).minutes.do(
@@ -1612,6 +1710,7 @@ def main() -> None:
         _run_all_pipelines()
         _run_trade_plan()
         _run_stock_scan()
+        _run_movers_digest()
         _run_bse_currency_scan()
         _run_volatility_scan()
     else:
