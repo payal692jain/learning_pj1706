@@ -1144,7 +1144,7 @@ def _run_bse_currency_scan(pre_open: bool = False) -> None:
     bse_result = empty
     try:
         histories, spots = fetch_stock_histories(
-            [_BSE_SYMBOL], interval=settings.data_interval,
+            [_BSE_SYMBOL], period=f"{settings.historical_days}d", interval=settings.data_interval,
             upstox_token=settings.upstox_access_token, master=master,
         )
         if histories:
@@ -1277,6 +1277,7 @@ def _run_stock_scan(pre_open: bool = False) -> None:
     try:
         histories, spots = fetch_stock_histories(
             NIFTY50_SYMBOLS,
+            period=f"{settings.historical_days}d",
             interval=settings.data_interval,
             upstox_token=settings.upstox_access_token,
             master=get_instrument_master(),
@@ -1374,6 +1375,7 @@ def _run_volatility_scan() -> None:
     try:
         histories, spots = fetch_stock_histories(
             NIFTY50_SYMBOLS,
+            period=f"{settings.historical_days}d",
             interval=settings.data_interval,
             upstox_token=settings.upstox_access_token,
             master=get_instrument_master(),

@@ -109,6 +109,9 @@ def _dispatch(command: str, arg: str, chat_id: int, username: str, store) -> str
             return "You're not subscribed. Send /start to begin."
         return f"Subscribed. Capital ₹{sub.capital:,.0f}, risk {sub.risk_pct:g}% per trade."
 
+    if command in ("sectors", "sector"):
+        return _sectors()
+
     if command in ("movers", "gainers", "losers", "topmovers"):
         return _movers()
 
@@ -140,6 +143,54 @@ def _dispatch(command: str, arg: str, chat_id: int, username: str, store) -> str
         return _analyse(command)
 
     return "Unknown command. Send /help, or a symbol like NIFTY or RELIANCE."
+
+
+def _sectors() -> str:
+    """Stock scan grouped by sector. Lazily imported like the other heavy commands."""
+    from datetime import datetime
+
+    import pytz
+
+    from nifty_ai_agent.config import get_settings
+    from nifty_ai_agent.data.fundamentals import fetch_fundamentals
+    from nifty_ai_agent.data.instrument_master import get_instrument_master
+    from nifty_ai_agent.data.nifty50_stocks import NIFTY50_SYMBOLS
+    from nifty_ai_agent.data.stock_data import fetch_stock_histories
+    from nifty_ai_agent.reports.sector_scan import format_sector_scan
+    from nifty_ai_agent.risk.calculator import RiskCalculator
+    from nifty_ai_agent.strategies.stock_scanner import scan_stocks
+
+    settings = get_settings()
+    lookup = None
+    if settings.upstox_access_token:
+        from nifty_ai_agent.data.upstox_provider import UpstoxClient
+        lookup = UpstoxClient(settings.upstox_access_token).get_ltp
+    try:
+        master = get_instrument_master()
+        histories, spots = fetch_stock_histories(
+            NIFTY50_SYMBOLS, period=f"{settings.historical_days}d", interval=settings.data_interval,
+            upstox_token=settings.upstox_access_token, master=master,
+        )
+        if not histories:
+            return "No stock data available right now."
+        result = scan_stocks(
+            histories, spots, master=master,
+            risk_calculator=RiskCalculator(
+                max_risk_pct=settings.max_risk_per_trade_pct,
+                min_rr=settings.min_risk_reward_ratio,
+                atr_sl_multiplier=settings.atr_sl_multiplier,
+            ),
+            now=datetime.now(pytz.timezone("Asia/Kolkata")).time(),
+            premium_lookup=lookup or (lambda keys: {}),
+            default_iv=settings.stock_default_iv, top_n=12,
+            fundamentals=fetch_fundamentals(list(histories)),
+            earnings_blackout_days=settings.earnings_blackout_days,
+            trend_tf=settings.stock_trend_timeframe,
+        )
+    except Exception as exc:
+        logger.error("Sectors command failed: %s", exc)
+        return f"Could not build the sector view ({type(exc).__name__})."
+    return format_sector_scan(result)[1]
 
 
 def _movers() -> str:

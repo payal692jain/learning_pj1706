@@ -44,7 +44,7 @@ def analyse_stock(symbol: str, settings, premium_lookup=None) -> str:
     try:
         master = get_instrument_master()
         histories, spots = fetch_stock_histories(
-            [ticker], interval=settings.data_interval,
+            [ticker], period=f"{settings.historical_days}d", interval=settings.data_interval,
             upstox_token=settings.upstox_access_token, master=master,
         )
         if not histories or spots.get(ticker, 0.0) <= 0:
