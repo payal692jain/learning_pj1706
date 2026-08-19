@@ -68,6 +68,11 @@ class StockIdea:
     # Event/fundamental context — None when nothing was fetched for this name.
     fundamentals: object | None = None
     volume_ratio: float | None = None   # pace-adjusted vs 20d average
+    # Levels for trading the SHARES rather than the option. Derived from the DAILY
+    # ATR, not the intraday one: a 5-minute ATR puts the target ~0.4% away, which
+    # is a scalp, not a reason to own a stock. 0.0 when daily bars were unavailable.
+    cash_target: float = 0.0
+    cash_stop: float = 0.0
 
 
 @dataclass
@@ -274,6 +279,9 @@ def _build_idea(
         )
 
     risk = risk_calculator.calculate(consensus.signal, spot, atr)
+    cash_target, cash_stop = _cash_levels(
+        hist, spot, bullish=consensus.signal == SignalType.BUY_CE,
+    )
     target_premium, stop_premium = _project_premiums(
         entry_premium, spot, risk, contract, expiry_str, opt_type, default_iv,
     )
@@ -297,6 +305,8 @@ def _build_idea(
         stop_premium=stop_premium,
         fundamentals=fund,
         volume_ratio=volume_ratio,
+        cash_target=cash_target,
+        cash_stop=cash_stop,
     )
 
 
@@ -322,6 +332,40 @@ def _trend_signal(hist, trend_tf: str, strategies, now):
     except Exception as exc:
         logger.debug("Trend read on %s failed: %s", trend_tf, exc)
         return None
+
+
+def _cash_levels(hist, spot: float, bullish: bool, atr_mult: float = 1.5,
+                 rr: float = 2.0) -> tuple[float, float]:
+    """Swing-scale target and stop for holding the SHARES, from the daily ATR.
+
+    The intraday risk engine sizes for an option scalp — roughly 0.4% on a
+    5-minute ATR. Presented as a stock buy/sell price that is actively
+    misleading: nobody takes delivery for 0.4%, and a stop that tight is inside
+    a single day's noise. Recomputing on daily bars gives levels someone could
+    hold a position against.
+
+    Returns (0.0, 0.0) when there are too few daily bars to trust an ATR.
+    """
+    try:
+        daily = hist.resample("1D").agg({
+            "open": "first", "high": "max", "low": "min",
+            "close": "last", "volume": "sum",
+        }).dropna(how="any")
+        # ATR(14) needs its window plus a bar to be worth anything.
+        if len(daily) < 15:
+            return 0.0, 0.0
+        from nifty_ai_agent.indicators.atr import compute_atr
+
+        atr = float(compute_atr(daily)["atr"].iloc[-1])
+        if not atr or atr <= 0:
+            return 0.0, 0.0
+        risk = atr * atr_mult
+        if bullish:
+            return round(spot + risk * rr, 2), round(spot - risk, 2)
+        return round(spot - risk * rr, 2), round(spot + risk, 2)
+    except Exception as exc:
+        logger.debug("Cash levels unavailable: %s", exc)
+        return 0.0, 0.0
 
 
 def _project_premiums(
