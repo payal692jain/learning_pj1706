@@ -31,7 +31,8 @@ HELP = (
     "/setcapital 100000 — deployable capital (₹)\n"
     "/risk 1 — % risked per trade (0–10)\n"
     "/status — show your settings\n"
-    "\n📈 TRACK\n"
+    "\n📈 MARKET\n"
+    "/movers — top 10 gainers and losers (F&O universe)\n"
     "/performance — hit rate of closed calls\n"
     "\n🔔 SUBSCRIPTION\n"
     "/start — subscribe   /stop — unsubscribe\n"
@@ -108,6 +109,9 @@ def _dispatch(command: str, arg: str, chat_id: int, username: str, store) -> str
             return "You're not subscribed. Send /start to begin."
         return f"Subscribed. Capital ₹{sub.capital:,.0f}, risk {sub.risk_pct:g}% per trade."
 
+    if command in ("movers", "gainers", "losers", "topmovers"):
+        return _movers()
+
     if command in ("performance", "stats", "score"):
         from nifty_ai_agent.backtesting.scorecard import (
             build_scorecard, format_scorecard,
@@ -136,6 +140,27 @@ def _dispatch(command: str, arg: str, chat_id: int, username: str, store) -> str
         return _analyse(command)
 
     return "Unknown command. Send /help, or a symbol like NIFTY or RELIANCE."
+
+
+def _movers() -> str:
+    """Top gainers and losers. Imported lazily, like the other heavy commands."""
+    from nifty_ai_agent.config import get_settings
+    from nifty_ai_agent.data.instrument_master import get_instrument_master
+    from nifty_ai_agent.data.market_movers import fetch_market_movers
+    from nifty_ai_agent.reports.movers import format_movers
+
+    settings = get_settings()
+    if not settings.upstox_access_token:
+        return "Movers need an Upstox token — quotes are an authenticated endpoint."
+    try:
+        snapshot = fetch_market_movers(
+            settings.upstox_access_token, get_instrument_master(),
+            top_n=settings.movers_top_n,
+        )
+    except Exception as exc:
+        logger.error("Movers command failed: %s", exc)
+        return f"Could not fetch movers ({type(exc).__name__}). Try again shortly."
+    return format_movers(snapshot, top_n=settings.movers_top_n)[1]
 
 
 def _is_tradeable(word: str) -> bool:
