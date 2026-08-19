@@ -58,8 +58,16 @@ def format_trade_call(
     global_snapshot: GlobalSnapshot | None = None,
     bank_ideas: list[BankOptionIdea] | None = None,
     prediction: bool = False,
+    compact: bool = False,
 ) -> tuple[str, str]:
-    """Return (title, body) for one index's trade call."""
+    """Return (title, body) for one index's trade call.
+
+    *compact* keeps only the decision and the trade: which contract, at what
+    price, with what levels. The strategy vote, the global cues and the bank
+    constituent ideas are dropped. They are worth reading when you go looking for
+    why a call was made; they are not worth scrolling past on a phone every time
+    one arrives, and a message people scroll past is one they stop reading.
+    """
     icon = _CONVICTION_ICON.get(consensus.conviction, "")
     action = (
         f"{consensus.signal.value} — {consensus.conviction} {consensus.confidence}%"
@@ -78,17 +86,28 @@ def format_trade_call(
             index_name, consensus, risk, analysis, margin, lot_size,
         )
     else:
-        essential.append(f"⏸ {consensus.rationale}")
-    essential.append("")
+        # A no-trade needs one line saying why, not the full rationale paragraph.
+        essential.append(f"⏸ {_short_rationale(consensus.rationale) if compact else consensus.rationale}")
 
-    optional = _strategy_table(consensus)
-    if global_snapshot and global_snapshot.is_available:
-        optional += _global_lines(global_snapshot)
-    if bank_ideas:
-        optional += format_bank_options(bank_ideas, margin.capital) + [""]
+    optional: list[str] = []
+    if not compact:
+        essential.append("")
+        optional = _strategy_table(consensus)
+        if global_snapshot and global_snapshot.is_available:
+            optional += _global_lines(global_snapshot)
+        if bank_ideas:
+            optional += format_bank_options(bank_ideas, margin.capital) + [""]
 
-    footer = ["⚠️ Estimates, not advice. Options can lose 100%."]
+    footer = ["⚠️ Not advice. Options can lose 100%."] if compact else [
+        "⚠️ Estimates, not advice. Options can lose 100%."
+    ]
     return title, fit_sections(essential, optional, footer)
+
+
+def _short_rationale(rationale: str, limit: int = 70) -> str:
+    """First clause of the rationale — enough to know why, not a paragraph."""
+    head = rationale.split(".")[0].strip()
+    return head if len(head) <= limit else head[: limit - 1].rstrip() + "…"
 
 
 def _contract_lines(
